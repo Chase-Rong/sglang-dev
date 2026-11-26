@@ -44,6 +44,7 @@ def initialize_fsa_backend(backend, model_runner):
         sparse_mtp_rows,
         sparse_mtp_tail,
     )
+    from sglang.srt.layers.dp_attention import get_eager_max_batch_size
     from sglang.srt.runtime_context import get_exec, get_spec
 
     from .config import (
@@ -114,7 +115,10 @@ def initialize_fsa_backend(backend, model_runner):
             if graph.backend != "disabled"
             else 0
         )
-        row_capacity = max(backend.req_to_token_pool.size, graph_requests) * routes
+        batch_capacity = max(
+            get_eager_max_batch_size(backend.req_to_token_pool.size), graph_requests
+        )
+        row_capacity = batch_capacity * routes
         graph_reservation = (
             graph.backend,
             tuple(graph.bs or ()),
@@ -128,7 +132,7 @@ def initialize_fsa_backend(backend, model_runner):
             page_size=backend.page_size,
             dtype=model_runner.kv_cache_dtype,
             qcap=backend.req_to_token_pool.req_generation.numel(),
-            bcap=max(backend.req_to_token_pool.size, graph_requests),
+            bcap=batch_capacity,
             tcap=row_capacity,
             graph_reservation=graph_reservation,
             abi=execution_abi,
@@ -146,7 +150,7 @@ def initialize_fsa_backend(backend, model_runner):
             max_query_routes=routes,
             page_size=backend.page_size,
             execution_abi=execution_abi,
-            batch_capacity=max(backend.req_to_token_pool.size, graph_requests),
+            batch_capacity=batch_capacity,
             load_mode=load_mode,
             warmup_threshold=warmup_threshold,
             draft_topology_reuse=draft_topology_reuse,

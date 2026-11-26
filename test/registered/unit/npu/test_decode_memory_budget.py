@@ -168,6 +168,32 @@ def test_mtp_sizes_query_rows_instead_of_request_count():
     assert graph.row_capacity(9) == 36
 
 
+@pytest.mark.parametrize("graph_rows,routes,batch", [(0, 1, 4), (0, 3, 4), (8, 1, 8)])
+def test_eager_padding_reserves_workspace_for_padded_batches(graph_rows, routes, batch):
+    requests = 2
+    model = budget(
+        graph_rows=graph_rows,
+        rows_per_request=routes,
+        pad_eager_batch_size=lambda size: (size + 3) // 4 * 4,
+    )
+    assert model.external_request_slots(requests) == 3
+    assert model.row_capacity(requests) == batch * routes
+    expected = MODULE.shared_storage_bytes(
+        3,
+        batch,
+        batch * routes,
+        model.layers,
+        model.topk,
+        model.selection_capacity(128),
+        128,
+        routes,
+        native_workspace_bytes=model.native_workspace_bytes,
+    )
+    assert model.shared_persistent_bytes(requests, 128)["device"] == (
+        expected["device_owner_global"] + expected["device_layers"]
+    )
+
+
 def test_target_and_draft_budget_includes_both_backings_and_selection():
     target = budget(layers=4)
     combined = budget(layers=5, rows_per_request=4)

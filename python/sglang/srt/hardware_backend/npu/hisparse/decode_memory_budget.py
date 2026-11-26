@@ -1,5 +1,6 @@
 """Capacity accounting for registered Decode KV and persistent FSA state."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
 
@@ -278,6 +279,7 @@ class DecodeKvMemoryBudget:
     warmup_threshold: int | None = None
     topology_cache_layers: int = 0
     three_stage: bool = False
+    pad_eager_batch_size: Callable[[int], int] | None = None
 
     def __post_init__(self):
         from .config import (
@@ -392,8 +394,14 @@ class DecodeKvMemoryBudget:
             )
         return capacity
 
+    def workspace_shape(self, requests):
+        if self.pad_eager_batch_size is not None:
+            requests = self.pad_eager_batch_size(requests)
+        batch = max(requests, self.graph_rows)
+        return batch, batch * self.rows_per_request
+
     def row_capacity(self, requests):
-        return max(requests, self.graph_rows) * self.rows_per_request
+        return self.workspace_shape(requests)[1]
 
     def external_request_slots(self, requests):
         """Price the candidate pool before it exists, including reserved rows."""
@@ -404,8 +412,7 @@ class DecodeKvMemoryBudget:
 
     def shared_persistent_bytes(self, request_rows, page_size):
         qcap = self.external_request_slots(request_rows)
-        bcap = max(request_rows, self.graph_rows)
-        tcap = self.row_capacity(request_rows)
+        bcap, tcap = self.workspace_shape(request_rows)
         values = shared_storage_bytes(
             qcap,
             bcap,
@@ -452,8 +459,7 @@ class DecodeKvMemoryBudget:
 
         persistent = self.shared_persistent_bytes(request_rows, page_size)
         qcap = self.external_request_slots(request_rows)
-        bcap = max(request_rows, self.graph_rows)
-        tcap = self.row_capacity(request_rows)
+        bcap, tcap = self.workspace_shape(request_rows)
         capacity = self.selection_capacity(page_size)
         width = shared_union_width(self.rows_per_request, self.topk)
         # Explicit bucket/step shapes give exact retained FSA snapshot bytes.
@@ -746,6 +752,7 @@ def budget_from_config(kvc, layers):
         sparse_mtp_draft_layers,
         sparse_mtp_rows,
     )
+    from sglang.srt.layers.dp_attention import get_eager_max_batch_size
     from sglang.srt.runtime_context import get_disagg, get_exec, get_spec
 
     if (
@@ -878,6 +885,7 @@ def budget_from_config(kvc, layers):
         execution_abi=execution_abi,
         native_workspace_bytes=native_workspace,
         three_stage=True,
+        pad_eager_batch_size=get_eager_max_batch_size,
         topology_cache_layers=topology_cache_layers,
         shared_graph_executions=tuple(
             (b, b * rows_per_request)

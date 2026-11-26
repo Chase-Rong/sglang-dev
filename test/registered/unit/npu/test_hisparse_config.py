@@ -273,6 +273,9 @@ def test_external_plan_initializes_with_only_the_fsa_loader(monkeypatch):
     wheel = ModuleType("sgl_kernel_npu.hisparse")
     wheel.load_fsa = Mock()
     monkeypatch.setitem(sys.modules, wheel.__name__, wheel)
+    dp_attention = ModuleType("sglang.srt.layers.dp_attention")
+    dp_attention.get_eager_max_batch_size = Mock(return_value=4)
+    monkeypatch.setitem(sys.modules, dp_attention.__name__, dp_attention)
     monkeypatch.setattr(runtime_context, "get_disagg", lambda: args("decode"))
     monkeypatch.setattr(runtime_context, "get_spec", lambda: SimpleNamespace())
     decode = SimpleNamespace(backend="disabled", bs=None, max_bs=None)
@@ -307,8 +310,11 @@ def test_external_plan_initializes_with_only_the_fsa_loader(monkeypatch):
     monkeypatch.delenv("SGLANG_NPU_DSA_OFFLOAD_BACKEND")
     initialize_fsa_backend(backend, runner)
     wheel.load_fsa.assert_called_once_with()
+    dp_attention.get_eager_max_batch_size.assert_called_once_with(pool.size)
     assert isinstance(backend.fused_sparse_state, FusedSparseAttentionState)
     assert backend.fused_sparse_state.shared_topk == 2051
+    assert backend.fused_sparse_state.batch_capacity == 4
+    assert backend.fused_sparse_state.row_capacity == 4
 
 
 @pytest.mark.parametrize("role", ["null", "prefill", "decode"])

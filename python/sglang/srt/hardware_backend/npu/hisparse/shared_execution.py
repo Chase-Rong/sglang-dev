@@ -362,7 +362,10 @@ def reserve_shared(state, layer_id, rows, topk, full_rope, full_kv):
         )
         state.layers[layer_id] = current
     if rows > current.rows or topk != current.topk:
-        raise ValueError("shared reservation cannot grow after initialization")
+        raise ValueError(
+            f"FSA input rows={rows}, topk={topk} exceed or mismatch the "
+            f"workspace reservation rows={current.rows}, topk={current.topk}"
+        )
     return current
 
 
