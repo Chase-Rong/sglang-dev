@@ -1945,7 +1945,16 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        shared_forward = contextlib.nullcontext()
+        if self.enable_hisparse and _is_npu:
+            from sglang.srt.hardware_backend.npu.hisparse.shared_execution import (
+                checked_shared_forward,
+            )
+
+            shared_forward = checked_shared_forward()
+
         with (
+            shared_forward,
             canary_ctx,
             step_span_ctx,
             record_ctx,

@@ -43,6 +43,11 @@ class DraftHostTableScope:
         return output
 
 
+def fsa_resident_epoch(binding):
+    """Use the conservative mapping epoch for bindings without a resident version."""
+    return getattr(binding, "resident_epoch", binding.mapping_epoch)
+
+
 class OffloadPageBinding:
     def __init__(self, host_pool, device, device_pages):
         self.host_pool = host_pool
@@ -54,6 +59,7 @@ class OffloadPageBinding:
         self.device_to_host_cpu = torch.zeros(device_pages, dtype=torch.int64)
         self.device_to_host = self.device_to_host_cpu.to(self.device)
         self.mapping_epoch = 0
+        self.resident_epoch = 0
         self.references = torch.zeros(host_pool.page_num, dtype=torch.int64)
         self.cache_references = torch.zeros_like(self.references)
         self.host_generations = torch.zeros_like(self.references)
@@ -98,12 +104,14 @@ class OffloadPageBinding:
         ):
             raise ValueError("Offload device page is outside the allocated pool")
 
-    def _update(self, device_pages, host_pages):
+    def _update(self, device_pages, host_pages, *, invalidate_resident=True):
         self.device_to_host_cpu[device_pages] = host_pages
         self.device_to_host.index_copy_(
             0, device_pages.to(self.device), host_pages.to(self.device)
         )
         self.mapping_epoch += 1
+        if invalidate_resident:
+            self.resident_epoch += 1
 
     def check_reader_health(self):
         if self.reader_failure is not None:
@@ -148,6 +156,7 @@ class OffloadPageBinding:
             self.retired.clear()
 
     def ensure_pages(self, device_pages):
+        """Only a fresh Host page appended to an unmapped row preserves residency."""
         with self.lock:
             self.reap()
             pages = torch.unique(
@@ -166,9 +175,12 @@ class OffloadPageBinding:
             if rows is None:
                 return False
             host_pages = rows[:: self.page_size] // self.page_size
-            self.host_generations[host_pages] += 1
+            generations = self.host_generations[host_pages] + 1
+            self.host_generations[host_pages] = generations
             self.references.index_add_(0, host_pages, torch.ones_like(host_pages))
-            self._update(missing, host_pages)
+            self._update(
+                missing, host_pages, invalidate_resident=bool((generations > 1).any())
+            )
             return True
 
     def host_rows(self, device_rows):
@@ -400,6 +412,7 @@ class OffloadPageBinding:
             self.device_to_host_cpu.zero_()
             self.device_to_host.zero_()
             self.mapping_epoch += 1
+            self.resident_epoch += 1
             self.ready_event = None
 
 

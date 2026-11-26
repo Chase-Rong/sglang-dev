@@ -1317,6 +1317,10 @@ class Envs:
     # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
+    SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION = EnvBool(False)
+    SGLANG_NPU_FUSED_SPARSE_ATTENTION_MODE = EnvStr("fused")
+    SGLANG_NPU_FSA_RESIDENT_CAPACITY = EnvInt(4096)
+    SGLANG_NPU_DSA_OFFLOAD_BACKEND = EnvStr("external_plan")
     SGLANG_NPU_SHARED_HOST_KV = EnvBool(True)
     SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD = EnvBool(False)
     SGLANG_NPU_LAYER_STAGING_BYTES = EnvInt(0)

@@ -162,6 +162,11 @@ class DecodeHostKvBacking:
         return self.hicache_pool
 
     def write_current(self, layer_id, locations, latent, rope):
+        writeback = getattr(self, "current_writeback", None)
+        if writeback is not None and writeback.submitting:
+            for tensor in (locations, latent, rope):
+                if tensor is not None and tensor.device.type == "npu":
+                    tensor.record_stream(writeback.stream)
         destinations = locations.reshape(-1).to(dtype=torch.int64).contiguous()
         if self.page_binding is None:
             raise RuntimeError("Host offload requires HiCache page ownership")

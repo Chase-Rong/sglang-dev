@@ -231,6 +231,13 @@ def test_prefix_and_slot_reuse_dependencies(setup, h2d, d2h, slots):
             case.pool.decode_host_backing.page_binding.ready_event
             is runtime.host_visible
         )
+        assert runtime.warmup_publication == (
+            (0,),
+            (41,),
+            (length,),
+            17,
+            runtime.host_visible,
+        )
         assert len(case.plans) == runtime.generation
         assert all(plan.shape[1] == 3 for plan in case.plans[-1])
         assert all(torch.all(plan[:, 0] != plan[:, 1]) for plan in case.plans[-1])
@@ -516,10 +523,12 @@ def test_missing_predecessor_hook_rejected_before_future_wait(setup):
             case.runtime.prepare_layer(8)
 
 
-def test_empty_write_generation_and_request_release(setup):
+@pytest.mark.parametrize("sequence_metadata", [False, True])
+def test_empty_write_generation_and_request_release(setup, sequence_metadata):
     case = setup()
     batch = SimpleNamespace(
         extend_prefix_lens_cpu=[0],
+        seq_lens_cpu=torch.tensor([0]) if sequence_metadata else None,
         req_pool_indices=torch.tensor([0]),
         out_cache_loc=case.mapping[:0],
         forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: True),
@@ -532,6 +541,16 @@ def test_empty_write_generation_and_request_release(setup):
             case.device.current.mark(f"scatter-1-{layer - 7}")
             case.runtime.on_compute_start(layer)
             case.runtime.finish_layer(layer)
+    if sequence_metadata:
+        assert case.runtime.warmup_publication == (
+            (0,),
+            (41,),
+            (0,),
+            17,
+            case.runtime.host_visible,
+        )
+    else:
+        assert not hasattr(case.runtime, "warmup_publication")
     case.runtime.release_request("request")
     assert not case.runtime.retired and case.runtime.host_visible is None
 

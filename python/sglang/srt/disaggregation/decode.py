@@ -3841,7 +3841,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     )
 
                     publish_received_host_kv(layer_pool)
+                received_committed_length = None
+                record = None
+                if layer_pool is not None:
+                    coordinator = getattr(self.scheduler, "hisparse_coordinator", None)
+                    snapshot = getattr(
+                        coordinator, "warmup_publication_committed_length", None
+                    )
+                    record = getattr(coordinator, "record_warmup_publication", None)
+                    if snapshot is not None and record is not None:
+                        received_committed_length = snapshot(decode_req.req)
                 self._commit_transfer_to_req(decode_req)
+                if (
+                    received_committed_length is not None
+                    and not decode_req.req.finished()
+                ):
+                    record(decode_req.req, received_committed_length)
                 # The peer wrote its last byte.
                 end_network_transfer(
                     kv_storage_of(

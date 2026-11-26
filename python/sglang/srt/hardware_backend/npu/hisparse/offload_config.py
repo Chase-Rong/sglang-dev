@@ -300,3 +300,129 @@ def _pool_host_memory_plan(
         raise ValueError("Target/draft Host memory reservations must match")
     kvc._offload_host_memory_plan = plan
     return plan
+
+
+def fsa_pool_options(kvc, layer_count, *, token_capacity=None):
+    import torch
+
+    from sglang.srt.arg_groups.model_override_base import resolved_view
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_disagg
+
+    prefill = envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
+    host_budget = envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get()
+    integrated = envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get()
+    if integrated:
+        from sglang.srt.runtime_context import get_parallel, get_schedule
+
+        validate_integrated_layout(
+            integrated=integrated,
+            prefill=prefill,
+            mixed_chunk=get_schedule().enable_mixed_chunk,
+            cp_size=get_parallel().attn_cp_size,
+            dcp_size=get_parallel().attn_dcp_size,
+        )
+    if not prefill and not host_budget and not integrated:
+        return {}
+    from sglang.srt.hardware_backend.npu.hisparse.host_native import host_ops
+    from sglang.srt.hardware_backend.npu.shared_host_kv import (
+        shared_host_group_from_runtime,
+    )
+
+    role = get_disagg().disaggregation_mode
+    if str(kvc.device).split(":")[0] != "npu" or not kvc.use_mla_backend:
+        raise ValueError("FSA Host offload requires an NPU MLA pool")
+    validate_offload_service(
+        resolved_view(kvc.server_args), role, integrated=integrated
+    )
+    if kvc.kv_cache_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("FSA Host KV requires FP16 or BF16 storage")
+    if role != "prefill" and (
+        kvc.kv_cache_dtype != torch.bfloat16 or kvc.model_dtype != torch.bfloat16
+    ):
+        raise ValueError("external_plan requires BF16 query and KV storage")
+    host_ops()
+    if integrated:
+        if (
+            not prefill
+            or host_budget <= 0
+            or not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get()
+        ):
+            raise ValueError(
+                "integrated offload requires Prefill slots, Host budget and fused attention"
+            )
+        from sglang.srt.runtime_context import get_parallel
+
+        if get_parallel().attn_cp_size != 1 or get_parallel().attn_dcp_size != 1:
+            raise ValueError("integrated offload requires CP=1 and DCP=1")
+        slots = min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), layer_count)
+        if slots <= 0:
+            raise ValueError("integrated offload requires positive Prefill layer slots")
+        options = {
+            "prefill_layer_slots": slots,
+            "decode_host_budget": host_budget,
+            "shared_host_group": shared_host_group_from_runtime(
+                torch.npu.current_device()
+            ),
+            "integrated_offload": True,
+            "host_memory_budget_plan": _pool_host_memory_plan(kvc, host_budget),
+        }
+        host_tokens = envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
+        if host_tokens:
+            options["decode_host_token_capacity"] = host_tokens
+        return options
+    if prefill:
+        if role != "prefill" or host_budget:
+            raise ValueError(
+                "Prefill layer slots and Decode Host budget belong to different services"
+            )
+        slots = min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), layer_count)
+        if slots <= 0 or envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get() <= 0:
+            raise ValueError("Prefill offload requires positive slot and Host budgets")
+        required = None
+        host_tokens = envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
+        if token_capacity is not None and not kvc.is_draft_worker:
+            from sglang.srt.configs.model_config import (
+                get_dsa_index_kpool,
+                get_dsa_index_kpool_compress,
+            )
+            from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
+                sparse_mtp_draft_layers,
+            )
+            from sglang.srt.runtime_context import get_schedule
+
+            model = kvc.model_config
+            index_width = (
+                0
+                if get_dsa_index_kpool(model.hf_config) > 1
+                and get_dsa_index_kpool_compress(model.hf_config)
+                else model.index_head_dim
+            )
+            required = (
+                (max(token_capacity, host_tokens) + get_schedule().page_size)
+                * (layer_count + sparse_mtp_draft_layers(kvc))
+                * (model.kv_lora_rank + model.qk_rope_head_dim + index_width)
+                * torch._utils._element_size(kvc.kv_cache_dtype)
+            )
+        return {
+            "prefill_layer_slots": slots,
+            "decode_host_budget": envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get(),
+            "decode_host_token_capacity": host_tokens,
+            "shared_host_group": shared_host_group_from_runtime(
+                torch.npu.current_device()
+            ),
+            "host_memory_budget_plan": _pool_host_memory_plan(
+                kvc,
+                envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get(),
+                required_bytes=required,
+            ),
+        }
+    if role != "decode" or not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get():
+        raise ValueError("Decode Host backing requires the fused FSA path")
+    host_tokens = envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()
+    return {
+        "decode_host_token_capacity": host_tokens,
+        "decode_host_budget": host_budget,
+        "shared_host_group": shared_host_group_from_runtime(torch.npu.current_device()),
+        "host_memory_budget_plan": _pool_host_memory_plan(kvc, host_budget),
+    }

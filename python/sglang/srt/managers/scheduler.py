@@ -5513,6 +5513,15 @@ class Scheduler(
                     input_ids_from_graph = self.resolve_forward_inputs(
                         batch, self.future_map
                     )
+                    if (
+                        batch.forward_mode.is_decode()
+                        and self.hisparse_coordinator is not None
+                    ):
+                        warmup = getattr(
+                            self.hisparse_coordinator, "warmup_committed_requests", None
+                        )
+                        if warmup is not None:
+                            warmup(batch.reqs)
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -5698,6 +5707,15 @@ class Scheduler(
                         req.lora_id for req in self._get_all_pp_reqs()
                     }
                 self.resolve_forward_inputs(batch, self.future_map)
+                if (
+                    batch.forward_mode.is_decode()
+                    and self.hisparse_coordinator is not None
+                ):
+                    warmup = getattr(
+                        self.hisparse_coordinator, "warmup_committed_requests", None
+                    )
+                    if warmup is not None:
+                        warmup(batch.reqs)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -5787,6 +5805,12 @@ class Scheduler(
                 # released like a client abort so its next chunk never runs.
                 self._pending_chunked_abort_req = self.chunked_req
 
+        if batch.forward_mode.is_extend() and self.hisparse_coordinator is not None:
+            record = getattr(
+                self.hisparse_coordinator, "record_local_warmup_publication", None
+            )
+            if record is not None:
+                record(batch.reqs)
         self._maybe_report_active_ranks()
 
         ret.forward_launch = launch
