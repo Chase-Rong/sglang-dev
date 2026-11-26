@@ -257,7 +257,15 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
+        source_locations = forward_batch.out_cache_loc
         forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        rebind = getattr(
+            getattr(model_runner, "prefill_offload_runtime", None),
+            "bind_copied_write_locations",
+            None,
+        )
+        if rebind is not None:
+            rebind(source_locations, forward_batch.out_cache_loc)
 
         cp_active = is_cp_active(forward_batch)
         if cp_active:

@@ -4297,6 +4297,7 @@ class HybridLinearKVPool(KVCache):
         host_to_device_ratio: Optional[int] = None,
         use_fp4_indexer: bool = False,
         use_combined_kv_buffer: bool = False,
+        fsa_pool_kwargs: Optional[dict] = None,
     ):
         self.size = size
         self.dtype = dtype
@@ -4377,6 +4378,7 @@ class HybridLinearKVPool(KVCache):
                 fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
+                **(fsa_pool_kwargs or {}),
             )
         else:
             MLAPoolClass = (
@@ -4401,6 +4403,9 @@ class HybridLinearKVPool(KVCache):
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
+        if fsa_pool_kwargs:
+            self.full_kv_pool.fsa_wire_layer_ids = tuple(full_attention_layer_ids)
+            self.full_kv_pool.model_layer_ids = tuple(full_attention_layer_ids)
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
         else:
@@ -4410,6 +4415,56 @@ class HybridLinearKVPool(KVCache):
     @property
     def backing_owner(self):
         return self.full_kv_pool.backing_owner
+
+    @property
+    def prefill_layer_slots(self):
+        return getattr(self.full_kv_pool, "prefill_layer_slots", None)
+
+    @property
+    def prefill_offload_runtime(self):
+        return getattr(self.full_kv_pool, "prefill_offload_runtime", None)
+
+    @prefill_offload_runtime.setter
+    def prefill_offload_runtime(self, runtime):
+        self.full_kv_pool.prefill_offload_runtime = runtime
+
+    @property
+    def decode_host_backing(self):
+        return getattr(self.full_kv_pool, "decode_host_backing", None)
+
+    @property
+    def kv_lora_rank(self):
+        return self.full_kv_pool.kv_lora_rank
+
+    @property
+    def qk_rope_head_dim(self):
+        return self.full_kv_pool.qk_rope_head_dim
+
+    @property
+    def layer_num(self):
+        return self.full_layer_nums
+
+    @property
+    def store_dtype(self):
+        return self.full_kv_pool.store_dtype
+
+    def layer_receive_lease(self, *args, **kwargs):
+        lease = self.full_kv_pool.layer_receive_lease(*args, **kwargs)
+        inverse = {
+            local: global_id
+            for global_id, local in self.full_attention_layer_id_mapping.items()
+        }
+        complete = lease.visibility
+        lease.layers = {
+            inverse[layer]: region for layer, region in lease.layers.items()
+        }
+        lease.prefixes = {
+            inverse[layer]: prefix for layer, prefix in lease.prefixes.items()
+        }
+        lease.visibility = lambda layer, start, end: complete(
+            self._transfer_full_attention_id(layer), start, end
+        )
+        return lease
 
     @property
     def post_capture_active(self) -> bool:

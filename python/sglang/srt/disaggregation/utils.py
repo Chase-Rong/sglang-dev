@@ -1481,10 +1481,12 @@ def build_kv_layer_ids(
     pairing: only a pool wrapping one token KV view (its other layers hold
     state), or one whose main page rows pair by layer id, reports them.
     """
-    # The owner region reports the ids its entries pair by. A unified pool's
-    # owner region is one whole-envelope entry with none, yet a pool wrapping
-    # one token KV view still pairs its draft's entries by id.
-    layer_ids = list(storage.regions(storage.owner).layer_ids)
+    entries = _npu_layer_transfer_entries(token_to_kv_pool)
+    layer_ids = (
+        [layer for _, layer in entries]
+        if entries is not None
+        else list(storage.regions(storage.owner).layer_ids)
+    )
     if not layer_ids and token_to_kv_pool.layer_router.wrapped_view() is None:
         return []
     if draft_token_to_kv_pool is None:
@@ -1504,7 +1506,10 @@ def remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List[
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
-    if pool.layer_router.wrapped_view() is not None:
+    entries = _npu_layer_transfer_entries(pool)
+    if entries is not None:
+        ids = [layer for _, layer in entries]
+    elif pool.layer_router.wrapped_view() is not None:
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per
@@ -1612,6 +1617,15 @@ def append_state_component(
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    if state_type == StateType.DSA and (
+        getattr(kv_args, "prefill_layerwise_offload", False)
+        or getattr(kv_args, "npu_layer_receive_pool", None) is not None
+    ):
+        pointer_layers = dict(zip(kv_args.kv_data_ptrs, kv_args.kv_layer_ids))
+        if all(pointer in pointer_layers for pointer in data_ptrs):
+            layer_ids = [pointer_layers[pointer] for pointer in data_ptrs]
     kv_args.state_types.append(state_type)
     kv_args.state_sub_pools.append(sub_pool)
     kv_args.state_wire_keys.append(wire_key)
@@ -1809,8 +1823,52 @@ def build_dsa_tail_transfer_blocks(
     return transfer_blocks
 
 
-def get_kv_transfer_buf_infos(storage: KVStorage | StaticKVStorage):
-    """The KV entries a PD peer registers: the storage's owner region."""
+def _npu_layer_transfer_entries(pool):
+    storage = getattr(pool, "full_kv_pool", pool)
+    slots = getattr(storage, "prefill_layer_slots", None)
+    backing = getattr(storage, "decode_host_backing", None)
+    if slots is None and backing is None:
+        return None
+    mapping = getattr(pool, "full_attention_layer_id_mapping", None)
+    layer_ids = (
+        list(mapping)
+        if mapping is not None
+        else list(range(storage.start_layer, storage.start_layer + storage.layer_num))
+    )
+    if len(layer_ids) != storage.layer_num:
+        raise ValueError("NPU PD layer inventory does not match its storage")
+    entries = []
+    for buffers in (storage.k_buffer, storage.v_buffer):
+        for local_layer, layer_id in enumerate(layer_ids):
+            entries.append(
+                (buffers[local_layer % (slots or storage.layer_num)], layer_id)
+            )
+    local_to_wire = dict(
+        zip(
+            range(storage.start_layer, storage.start_layer + storage.layer_num),
+            layer_ids,
+        )
+    )
+    if storage.index_k_buffer is not None:
+        entries.extend(
+            (storage.index_k_buffer[index], local_to_wire[layer])
+            for index, layer in enumerate(storage.indexer_layer_ids)
+        )
+    return entries
+
+
+def get_kv_transfer_buf_infos(storage=None, pool=None):
+    """Physical PD entries for the storage owner, or the bounded NPU view."""
+    entries = _npu_layer_transfer_entries(pool)
+    if entries is not None:
+        buffers = [buffer for buffer, _ in entries]
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes for buffer in buffers],
+        )
+    if storage is None:
+        return pool.get_contiguous_buf_infos()
     region = storage.regions(storage.owner)
     return list(region.ptrs), list(region.lens), list(region.item_lens)
 
@@ -1821,6 +1879,21 @@ def _wire_state_type(state_type) -> Enum:
     from sglang.srt.disaggregation.base.conn import StateType
 
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
+
+
+def get_kv_transfer_dcp_remote_decode_layout(pool):
+    """Describe the same ordered entries as the registered PD transfer inventory."""
+    storage = getattr(pool, "full_kv_pool", pool)
+    entries = _npu_layer_transfer_entries(pool)
+    if entries is not None:
+        kv_count = 2 * storage.layer_num
+        return [bool(storage.is_draft_worker)] * kv_count + [True] * (
+            len(entries) - kv_count
+        )
+    get_layout = getattr(pool, "get_dcp_remote_decode_layout", None)
+    if get_layout is None:
+        get_layout = getattr(storage, "get_dcp_remote_decode_layout", None)
+    return get_layout() if get_layout is not None else []
 
 
 def _nixl_kv_packable(owner_view, draft_token_to_kv_pool) -> bool:

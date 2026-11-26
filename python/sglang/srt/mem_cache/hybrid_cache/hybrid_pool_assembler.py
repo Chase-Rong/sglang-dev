@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import get_offload_backing
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
@@ -34,6 +35,10 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.base import (
+    ensure_host_memory_budget_scope,
+    host_memory_budget_bytes,
+)
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -66,11 +71,30 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.server_args import ServerArgs
 
+from sglang.srt.utils import is_npu
+
 logger = logging.getLogger(__name__)
 
 
 def _get_allocator_type() -> str:
     return get_allocator_type()
+
+
+def _host_pool_budgeted(builder):
+    @wraps(builder)
+    def build(**kwargs):
+        pool = kwargs.get("kv_pool")
+        if pool is None:
+            pool = kwargs["config"].root
+        pool = getattr(pool, "full_kv_pool", pool)
+        backing = get_offload_backing(pool)
+        account = getattr(backing, "host_memory_account", None)
+        if backing is None:
+            return builder(**kwargs)
+        with ensure_host_memory_budget_scope(account):
+            return builder(**kwargs)
+
+    return build
 
 
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
@@ -151,6 +175,31 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    backing = get_offload_backing(kv_pool)
+    if backing is not None:
+        if page_size <= 0 or page_size % kv_pool.page_size:
+            raise ValueError("HiCache radix page size does not match physical KV pages")
+        host = backing.bind_hicache(kv_pool)
+        host.pool_label = pool_label
+        if mtp_draft_device_pools:
+            host.attach_mtp_drafts(mtp_draft_device_pools)
+        return host
+    if getattr(kv_pool, "integrated_offload", False):
+        raise RuntimeError("Integrated HiCache requires an existing Host backing")
+    if is_npu() and getattr(kv_pool, "kpool_use_compress", False):
+        from sglang.srt.hardware_backend.npu.hicache_resident_pool import (
+            NpuResidentHiCachePool,
+        )
+
+        return NpuResidentHiCachePool(
+            kv_pool,
+            get_memory().hicache_ratio,
+            get_memory().hicache_size if host_size is None else host_size,
+            page_size,
+            allocator_type=_get_allocator_type(),
+            mtp_draft_device_pools=mtp_draft_device_pools,
+            pool_label=pool_label,
+        )
     host_input = kv_pool.get_device_pool_infos()[0].buffer_info
     use_mla = isinstance(host_input, MLABufferInfo)
     if use_mla:
@@ -1118,12 +1167,29 @@ def build_mamba_host_pool(
     host_size: float,
     layout: str,
     mtp_draft_device_pools=(),
+    preserve_host_capacity: bool = False,
 ):
     draft_buffer_infos = []
     for draft_pool in mtp_draft_device_pools:
         (draft_info,) = draft_pool.get_device_pool_infos()
         draft_info.buffer_info.validate(layer_ids=draft_info.layer_ids)
         draft_buffer_infos.append(draft_info.buffer_info)
+    ratio = get_memory().hicache_ratio
+    if preserve_host_capacity and mamba_pool.host_capacity_tokens is not None:
+        ratio = 1
+        host_size = 0
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.hicache_mamba_pool import NpuMambaPoolHost
+
+        return NpuMambaPoolHost(
+            mamba_pool,
+            ratio,
+            host_size,
+            buffer_info=pool_info.buffer_info,
+            mtp_draft_buffer_infos=draft_buffer_infos,
+            allocator_type=_get_allocator_type(),
+            layout=layout,
+        )
     from sglang.srt.mem_cache.pool_host.rocm_budget import mamba_host_ratio
 
     return MambaPoolHost(
@@ -1153,6 +1219,7 @@ def _mamba_entry(
     params: CacheInitParams,
     mamba_pool: Any,
     info: DevicePoolInfo,
+    preserve_host_capacity: bool = False,
     layer_mapping: dict[int, int],
     transfer_layer_id_max: int,
     host_size: float,
@@ -1166,6 +1233,7 @@ def _mamba_entry(
         host_pool=build_mamba_host_pool(
             mamba_pool,
             info,
+            preserve_host_capacity=preserve_host_capacity,
             host_size=host_size,
             layout=_state_host_layout(),
             mtp_draft_device_pools=drafts,
@@ -1186,6 +1254,7 @@ def _mamba_entry(
     )
 
 
+@_host_pool_budgeted
 def build_hybrid_mamba_stack(
     *,
     params: CacheInitParams,
@@ -1220,7 +1289,7 @@ def build_hybrid_mamba_stack(
     )
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
-    if get_memory().hicache_size > 0:
+    if get_memory().hicache_size > 0 and get_offload_backing(kv_pool) is None:
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
@@ -1228,6 +1297,45 @@ def build_hybrid_mamba_stack(
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
+    offload = get_offload_backing(kv_pool) is not None
+    if offload:
+        checkpoint_infos = [mamba_info.buffer_info]
+        checkpoint_infos.extend(
+            pool.get_device_pool_infos()[0].buffer_info
+            for pool in params.mtp_draft_mamba_pools
+        )
+        bytes_per_checkpoint = sum(
+            sum(
+                buffer[:, 0].numel() * buffer.element_size()
+                for buffer in (info.temporal, *info.conv)
+            )
+            + sum(
+                buffer[0].numel() * buffer.element_size()
+                for buffer in info.extra_checkpoint_buffers
+            )
+            for info in checkpoint_infos
+        )
+        capacity = mamba_pool.host_capacity_tokens
+        ratio = 1 if capacity is not None else get_memory().hicache_ratio
+        if capacity is None:
+            capacity = mamba_pool.size
+        sidecar_bytes = (int(capacity * ratio) + 1) * bytes_per_checkpoint
+        indexer = _npu_indexer_layers(kv_pool)
+        if indexer:
+            from sglang.srt.hardware_backend.npu.hicache_indexer_pool import (
+                npu_indexer_host_bytes_per_layer_page,
+            )
+
+            sidecar_bytes += (
+                (len(indexer) + len(config.packed_draft_device_pools))
+                * kv_pool.decode_host_backing.pages
+                * npu_indexer_host_bytes_per_layer_page(kv_pool)
+            )
+        if sidecar_bytes > host_memory_budget_bytes():
+            raise MemoryError(
+                f"NPU HiCache sidecars need {sidecar_bytes} bytes after the "
+                "aligned shared MemFabric reserve and per-rank Host allowances"
+            )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
@@ -1242,6 +1350,7 @@ def build_hybrid_mamba_stack(
             layer_mapping=mamba_layer_mapping,
             transfer_layer_id_max=transfer_layer_id_max,
             host_size=mamba_host_size,
+            preserve_host_capacity=offload,
             host_evict_fn=host_mamba_evict_fn,
             device_evict_fn=device_mamba_evict_fn,
         ),
@@ -1580,6 +1689,7 @@ def build_unified_host_stack(
     )
 
 
+@_host_pool_budgeted
 def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
     root_host_pool = build_kv_host_pool(
         kv_pool=config.root,
@@ -1653,6 +1763,27 @@ def _build_qsa_indexer_host_pool(
     )
 
 
+def _group_sidecar_specs(config, group):
+    specs = [c.sidecar_spec() for c in config.sidecars]
+    if (
+        PoolName.INDEXER in group.entry_map
+        and PoolName.INDEXER not in config.pool_names
+    ):
+        specs.append(
+            SidecarPoolSpec(pool_name=PoolName.INDEXER, indices_from_pool=PoolName.KV)
+        )
+    return specs
+
+
+def _npu_indexer_layers(root):
+    if not is_npu() or not getattr(root, "kpool_use_compress", False):
+        return ()
+    from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
+
+    native = root.get_device_pool_infos()[0].buffer_info.buffers
+    return native.index_layer_indices if isinstance(native, MLASplitBuffers) else ()
+
+
 def _kv_budget_index_bytes(config: HostPoolGroupConfig) -> int:
     # Compressed key rows share the KV host budget. DSA indexers sit on top of it.
     return sum(
@@ -1697,6 +1828,32 @@ def _build_pool_entries(
                 layer_mapping=sidecar.layer_mapping,
                 transfer_layer_id_max=config.transfer_layer_id_max,
                 packed_draft_device_pools=config.packed_draft_device_pools,
+                device_translate=device_translate,
+            )
+        )
+    index_layers = _npu_indexer_layers(config.root)
+    if index_layers and PoolName.INDEXER not in config.pool_names:
+        from sglang.srt.hardware_backend.npu.hicache_indexer_pool import (
+            NPUIndexerPoolHost,
+        )
+
+        drafts = config.packed_draft_device_pools
+        host_pool = NPUIndexerPoolHost(
+            config.root, root_host_pool, mtp_draft_device_pools=drafts
+        )
+        owned = set(index_layers) | set(
+            range(config.root.layer_num, config.root.layer_num + len(drafts))
+        )
+        entries.append(
+            build_pool_entry(
+                name=PoolName.INDEXER,
+                host_pool=host_pool,
+                device_pool=config.root,
+                layer_mapping={
+                    k: v for k, v in config.layer_mapping.items() if v in owned
+                },
+                transfer_layer_id_max=config.transfer_layer_id_max,
+                packed_draft_device_pools=drafts,
                 device_translate=device_translate,
             )
         )
@@ -2231,7 +2388,7 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
-            sidecars=[c.sidecar_spec() for c in config.sidecars],
+            sidecars=_group_sidecar_specs(config, host_pool_group),
             device_pool_names=config.pool_names,
             loads_state_layer_wise=True,
             pools_desc=" + ".join(
@@ -2493,7 +2650,7 @@ class _KvStrategy(StackStrategy):
             component_host_pools={
                 ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
             },
-            sidecars=[c.sidecar_spec() for c in config.sidecars],
+            sidecars=_group_sidecar_specs(config, host_pool_group),
             pools_desc=" + ".join(name.value.upper() for name in config.pool_names),
             device_pool_names=config.pool_names,
         )
