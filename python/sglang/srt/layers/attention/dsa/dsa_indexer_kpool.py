@@ -1912,7 +1912,29 @@ class IndexerKPool(MultiPlatformOp):
         # --- Read Phase ---
         # Get model weights. Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
         weights, _ = self.weights_proj(x.float())  # [T,H]
-        weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+        weights = weights * self.n_heads**-0.5
+        backend = get_attn_backend()
+        state = getattr(
+            getattr(backend, "full_attn_backend", backend), "fused_sparse_state", None
+        )
+        if (
+            getattr(state, "backend_name", None) == "lim_copy_sfa"
+            and not mode.is_extend_without_speculative()
+        ):
+            from sglang.srt.hardware_backend.npu.hisparse.lim_copy_sfa_backend import (
+                select_offloaded_topk,
+            )
+
+            return select_offloaded_topk(
+                backend,
+                self,
+                forward_batch,
+                layer_id,
+                query,
+                weights * self.softmax_scale,
+                metadata,
+            )
+        weights = weights.to(torch.bfloat16).contiguous()
         return _get_topk_npu(
             layer_id=layer_id,
             query=query,

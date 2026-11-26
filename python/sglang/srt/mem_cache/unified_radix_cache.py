@@ -2333,7 +2333,9 @@ class UnifiedRadixCache(BasePrefixCache):
         """Execute Backup action."""
         kv_tokens = len(device_value)
         anchor_entry = self.cache_controller.mem_pool_host.anchor_entry
-        if (
+        if not callable(
+            getattr(anchor_entry.host_pool, "acquire_device_pages", None)
+        ) and (
             anchor_entry.host_pool.shared_allocation_domain is None
             or anchor_entry.host_evict_fn is None
         ):
@@ -2507,11 +2509,16 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=node_id,
-            extra_pools=aux_xfers or None,
-        )
+        try:
+            device_indices = self.cache_controller.load(
+                host_indices=kv_xfer.host_indices,
+                node_id=node_id,
+                extra_pools=aux_xfers or None,
+            )
+        except Exception:
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            raise
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
@@ -5129,6 +5136,66 @@ class UnifiedRadixCache(BasePrefixCache):
                 path = torch.cat([path, tail])
         assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
         return path[: req.prefix_len]
+
+    def prefill_cache_prefix_proof(self, req: Req, request_rows: torch.Tensor):
+        """Snapshot the admitted public tree path, excluding linker/chunk tails.
+
+        Admission already holds the request's tree lock. Recheck every component
+        at the selected boundary after complete Unified load-back; FULL rows on
+        their own cannot prove a reusable KDA checkpoint.
+        """
+        from math import lcm
+
+        from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import (
+            CachePrefixProof,
+        )
+
+        root = self.tree_core.node_by_id(self.root_node_handle(req.extra_key))
+        node = self.tree_core.node_by_id(req.last_node)
+        group = self.page_size
+        for component in self._components_tuple:
+            group = lcm(group, getattr(component, "mamba_checkpoint_grid", group))
+        validators = tuple(
+            c.create_match_validator(match_device_only=True)
+            for c in self._components_tuple
+        )
+        while node is not root:
+            path = self.tree_core.collect_full_device_indices(node.id, root.id)
+            length = path.numel()
+            if (
+                length <= req.prefix_len
+                and length % group == 0
+                and all(validate(node) for validate in validators)
+            ):
+                break
+            node = node.parent
+        else:
+            return None
+        chunks = []
+        cursor = node
+        while cursor is not root:
+            key = cursor.key
+            if (
+                key.extra_key != req.extra_key
+                or key.cache_salt != (req.cache_salt or None)
+                or key.is_bigram
+            ):
+                raise ValueError("cache proof namespace differs from admitted request")
+            chunks.append(tuple(key.token_ids[: len(key)]))
+            cursor = cursor.parent
+        tokens = tuple(token for chunk in reversed(chunks) for token in chunk)
+        if tokens != tuple((req.origin_input_ids + req.output_ids)[:length]):
+            raise ValueError("cache proof tokens differ from admitted request")
+        rows = tuple(path.detach().to(device="cpu", dtype=torch.int64).tolist())
+        if rows != tuple(request_rows[:length].detach().cpu().tolist()):
+            raise ValueError("cache proof rows differ from admitted request")
+        return CachePrefixProof(
+            namespace=(id(self), req.extra_key, req.cache_salt or None),
+            token_ids=tokens,
+            device_rows=rows,
+            shared_prefix_len=length,
+            shared_group_size=group,
+        )
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())

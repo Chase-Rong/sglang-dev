@@ -31,6 +31,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.hardware_backend.npu.hisparse.fsa_graph_lifecycle import (
+    collect_fsa_graph_readers,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
@@ -64,6 +67,7 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         self._decode_runner = cuda_graph_runner
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._fsa_readers: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
@@ -441,7 +445,6 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             forward_fn()
             if post_warmup_hook is not None:
                 post_warmup_hook()
-
         graph = torch.npu.NPUGraph()
 
         graph_ctx: Callable[..., AbstractContextManager]
@@ -456,16 +459,26 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with graph_ctx(
-            graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            auto_dispatch_capture=True,
-        ):
-            out = forward_fn()
+        with collect_fsa_graph_readers() as fsa_readers:
+            try:
+                with graph_ctx(
+                    graph,
+                    pool=self._pool,
+                    stream=self._capture_stream,
+                    auto_dispatch_capture=True,
+                ):
+                    out = forward_fn()
+            except BaseException:
+                fsa_readers.capture_failed = True
+                raise
+            finally:
+                # Includes failed capture/forward after a Host reader was
+                # discovered. This runs after leaving the capture context.
+                fsa_readers.finish_capture(self._device_module)
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        self._fsa_readers[shape_key] = fsa_readers
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -542,7 +555,17 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                     attr_name=self.get_update_attr_name(),
                     attr_type=[],
                 )
-        self._graphs[shape_key].replay()
+        readers = self._fsa_readers.get(shape_key)
+        try:
+            if readers is not None:
+                readers.before_replay()
+            self._graphs[shape_key].replay()
+            if readers is not None:
+                readers.after_replay(self._device_module)
+        except Exception:
+            if readers is not None:
+                readers.drain_failure(self._device_module)
+            raise
         return self._outputs[shape_key]
 
     def _eagle_draft_extend_update_lengths(self, runner, forward_batch):
@@ -594,11 +617,21 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         if self._rebind_fence is not None:
             self._rebind_fence.synchronize()
 
-        update_future = self._update_executor.submit(
-            graph.update, cpu_update_input=cpu_update_input
-        )
-        graph.replay()
-        update_future.result()
+        readers = self._fsa_readers.get(shape_key)
+        try:
+            if readers is not None:
+                readers.before_replay()
+            update_future = self._update_executor.submit(
+                graph.update, cpu_update_input=cpu_update_input
+            )
+            graph.replay()
+            update_future.result()
+            if readers is not None:
+                readers.after_replay(self._device_module)
+        except Exception:
+            if readers is not None:
+                readers.drain_failure(self._device_module)
+            raise
 
         fence = self._device_module.Event()
         fence.record()
@@ -612,5 +645,6 @@ class NPUCudaGraphBackend(BaseGraphBackend):
             self._rebind_fence = None
         self._graphs.clear()
         self._outputs.clear()
+        self._fsa_readers.clear()
         self._pool = None
         self._decode_runner = None

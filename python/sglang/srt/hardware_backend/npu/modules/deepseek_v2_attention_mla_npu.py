@@ -422,6 +422,9 @@ def forward_dsa_prepare_npu(
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+        # MLAPO writes device KV directly. Host-backed rows must instead be
+        # published by the pool using the allocator's current page binding.
+        and getattr(get_token_to_kv_pool(), "decode_host_backing", None) is None
     )
     if mla_preprocess_used:
         (
@@ -814,7 +817,11 @@ def forward_dsa_core_npu(
     if not m.next_skip_topk:
         return output, None
     else:
-        return output, topk_indices
+        from sglang.srt.hardware_backend.npu.hisparse.planner_input import (
+            completed_selection,
+        )
+
+        return output, completed_selection(topk_indices)
 
 
 def npu_mla_preprocess(

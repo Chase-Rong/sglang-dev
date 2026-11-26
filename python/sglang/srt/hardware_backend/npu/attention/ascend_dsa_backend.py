@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_kpool
+from sglang.srt.configs.model_config import get_dsa_index_kpool, get_dsa_index_topk
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMultiStepDraftBackend,
@@ -37,6 +37,10 @@ class AscendDSAForwardMetadata(ForwardMetadata):
         None  # [B], int32, kv cache length (include history)
     )
     real_page_table: Optional[torch.Tensor] = None  # [B, Pkv], int32
+
+    fsa_query_lens_int32: Optional[torch.Tensor] = None
+    fsa_query_ends_int32: Optional[torch.Tensor] = None
+    host_page_table: Optional[torch.Tensor] = None
 
     # Inputs for pooled_key_indexer (batch-level)
     pool_query_ends: Optional[torch.Tensor] = (
@@ -108,8 +112,95 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             # 128-token physical KV pages. Metadata inherits this value.
             self.page_size //= self.dsa_index_kpool
 
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import (
+            initialize_fsa_backend,
+        )
+
+        self.dsa_index_topk = get_dsa_index_topk(hf_config)
+        initialize_fsa_backend(self, model_runner)
+
     def _create_forward_metadata(self) -> AscendDSAForwardMetadata:
         return AscendDSAForwardMetadata(page_size=self.page_size)
+
+    def forward_sparse(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        save_kv_cache=True,
+        q_rope=None,
+        k_rope=None,
+        topk_indices=None,
+    ):
+        is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        if self.fused_sparse_state is not None and not is_prefill:
+            from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import forward_fsa
+
+            return forward_fsa(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                topk_indices,
+            )
+        runtime = getattr(self.token_to_kv_pool, "prefill_offload_runtime", None)
+        if runtime is not None and is_prefill:
+            from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import (
+                sparse_pool_and_layer,
+            )
+
+            pool, local_layer = sparse_pool_and_layer(
+                self.token_to_kv_pool, layer.layer_id
+            )
+            if save_kv_cache:
+                k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
+                if k_rope is None:
+                    if self.qk_rope_head_dim:
+                        raise ValueError(
+                            "Prefill KV writes require the model's RoPE keys"
+                        )
+                    k_rope = k.new_empty((*k.shape[:-1], self.qk_rope_head_dim))
+                else:
+                    k_rope = k_rope.reshape(
+                        k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
+                    )
+                self.token_to_kv_pool.set_kv_buffer(
+                    layer, forward_batch.out_cache_loc, k, k_rope
+                )
+                save_kv_cache = False
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            start_hook = getattr(runtime, "on_compute_start", None)
+            if start_hook is not None:
+                start_hook(pool.start_layer + local_layer)
+        output = super().forward_sparse(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            topk_indices=topk_indices,
+        )
+        if runtime is not None and is_prefill:
+            runtime.finish_layer(pool.start_layer + local_layer)
+        return output
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        from sglang.srt.hardware_backend.npu.hisparse.fsa_backend import (
+            reserve_fsa_graph,
+        )
+
+        reserve_fsa_graph(self, max_num_tokens)
+        return super().init_cuda_graph_state(max_bs, max_num_tokens)
 
     def _init_cuda_graph_metadata(
         self,
@@ -174,8 +265,57 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
         ):
-            return max_seq_len + self.speculative_step_id + 1
+            max_seq_len += self.speculative_step_id + 1
+        scope = getattr(self, "_draft_host_table_scope", None)
+        if scope is not None:
+            max_seq_len += scope.last_step - self.speculative_step_id
         return max_seq_len
+
+    def _update_fsa_query_layout(self, metadata, query_lens, *, replay=False):
+        state = getattr(self, "fused_sparse_state", None)
+        if state is None or getattr(state, "backend_name", None) == "lim_copy_sfa":
+            metadata.fsa_query_lens_int32 = None
+            metadata.fsa_query_ends_int32 = None
+            return
+        if replay:
+            counts = metadata.fsa_query_lens_int32
+            ends = metadata.fsa_query_ends_int32
+            if (
+                counts is None
+                or ends is None
+                or (counts.shape != query_lens.shape or ends.shape != query_lens.shape)
+            ):
+                raise RuntimeError("FSA graph replay query layout differs from capture")
+            counts.copy_(query_lens)
+            ends.copy_(query_lens.cumsum(0).to(dtype=torch.int32))
+        else:
+            metadata.fsa_query_lens_int32 = query_lens.clone()
+            metadata.fsa_query_ends_int32 = query_lens.cumsum(0).to(dtype=torch.int32)
+
+    def _update_host_page_table(self, metadata, page_table, *, replay=False):
+        from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
+            get_offload_backing,
+        )
+
+        backing = get_offload_backing(self.token_to_kv_pool)
+        if backing is None:
+            if replay and metadata.host_page_table is not None:
+                raise RuntimeError(
+                    "DSA graph replay lost its captured Host page binding"
+                )
+            return
+        if backing.page_binding is None:
+            raise RuntimeError("DSA Host metadata requires HiCache page ownership")
+        scope = getattr(self, "_draft_host_table_scope", None)
+        output = metadata.host_page_table if replay else None
+        if scope is not None:
+            metadata.host_page_table = scope.host_table(
+                backing.page_binding, page_table, output
+            )
+        elif replay:
+            backing.page_binding.fill_host_table(page_table, output)
+        else:
+            metadata.host_page_table = backing.page_binding.host_table(page_table)
 
     def _initialize_dsa_metadata(self, forward_batch: ForwardBatch, *, capture=False):
         """Construct complete metadata for eager execution or graph capture."""
@@ -200,7 +340,8 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         if capture:
             max_num_pages = max(
                 page_table.shape[1],
-                self.req_to_token_pool.req_to_token.shape[1] // self.page_size,
+                (self.req_to_token_pool.req_to_token.shape[1] + self.page_size - 1)
+                // self.page_size,
             )
             metadata.real_page_table = torch.zeros(
                 (batch, max_num_pages), dtype=torch.int32, device=device
@@ -208,6 +349,9 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             metadata.real_page_table[:, : page_table.shape[1]].copy_(page_table)
         else:
             metadata.real_page_table = page_table
+
+        self._update_fsa_query_layout(metadata, query_lens)
+        self._update_host_page_table(metadata, metadata.real_page_table)
 
         # --- prepare kpool metadata ---
         if self.dsa_index_kpool > 1:
@@ -271,6 +415,9 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         metadata.cache_lens_int32.copy_(cache_lens)
         metadata.real_page_table[:, : page_table.shape[1]].copy_(page_table)
 
+        self._update_fsa_query_layout(metadata, query_lens, replay=True)
+        self._update_host_page_table(metadata, page_table, replay=True)
+
         # --- update kpool metadata ---
         if self.dsa_index_kpool > 1:
             ratio = self.dsa_index_kpool
@@ -316,12 +463,16 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        if self.fused_sparse_state is not None:
+            self.fused_sparse_state.refresh_generations()
         super().init_forward_metadata(forward_batch)
         self._initialize_dsa_metadata(forward_batch)
 
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ) -> None:
+        if self.fused_sparse_state is not None:
+            self.fused_sparse_state.refresh_generations()
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         if in_capture:
             self._initialize_dsa_metadata(forward_batch, capture=True)
@@ -341,6 +492,31 @@ class AscendDSAAttnMultiStepDraftBackend(AscendAttnMultiStepDraftBackend):
     """Create an Ascend backend that generates DSA metadata for each draft decode step."""
 
     backend_cls = AscendDSAAttnBackend
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
+            DraftHostTableScope,
+            get_offload_backing,
+        )
+
+        backends = [
+            backend
+            for backend in self.attn_backends[: self.speculative_num_steps - 1]
+            if get_offload_backing(backend.token_to_kv_pool) is not None
+        ]
+        scope = DraftHostTableScope(self.speculative_num_steps - 2)
+        previous_scopes = [
+            getattr(backend, "_draft_host_table_scope", None) for backend in backends
+        ]
+        for backend in backends:
+            backend._draft_host_table_scope = scope
+        try:
+            super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
+            )
+        finally:
+            for backend, previous in zip(backends, previous_scopes):
+                backend._draft_host_table_scope = previous
 
 
 def _get_topk_npu(

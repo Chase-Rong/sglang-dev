@@ -12,6 +12,7 @@ from typing import (
 
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
+from sglang.srt.managers.hisparse_factory import uses_hisparse_staging
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.utils.common import ceil_align
 
@@ -217,12 +218,12 @@ class SchedulerPoolStatsObserver:
         return [kv for kv in records if kv.holds_kv]
 
     def session_held_tokens(self) -> int:
-        page_size = self.tree_cache.page_size
+        page_size = self.token_to_kv_pool_allocator.page_size
         total = sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
         return total + self.tree_cache.retained_window_tokens()
 
     def session_held_window_tokens(self, sub_pool: str) -> int:
-        page_size = self.tree_cache.page_size
+        page_size = self.token_to_kv_pool_allocator.page_size
         total = sum(
             kv_private_window_tokens(kv, page_size, sub_pool)
             for kv in self._session_kv_rows()
@@ -285,6 +286,8 @@ class SchedulerPoolStatsObserver:
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
         if self.enable_hisparse and self.hisparse_coordinator is not None:
             h = self.hisparse_coordinator.get_token_stats()
+            if h is None:
+                return pool_stats
             return dataclasses.replace(
                 pool_stats,
                 is_hisparse=True,
@@ -377,7 +380,7 @@ class SchedulerPoolStatsObserver:
         # counter, producing negative used counts. We clamp to 0 to keep
         # token_usage / leak checks sane, but the underlying accounting bug
         # should be fixed so the clamp can go away.
-        if self.enable_hisparse:
+        if uses_hisparse_staging(self.hisparse_coordinator):
             full_num_used = max(0, full_num_used)
         if not full_capacity:
             full_num_used = 0
@@ -396,7 +399,7 @@ class SchedulerPoolStatsObserver:
                 available = from_cp_sharded(available)
             evictable = 0 if req_ring else self._window_evictable_size(window.name)
             num_used = capacity - (available + evictable)
-            if self.enable_hisparse:
+            if uses_hisparse_staging(self.hisparse_coordinator):
                 num_used = max(0, num_used)
             if not capacity:
                 num_used, available, token_usage = 0, 0, 0.0

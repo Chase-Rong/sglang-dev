@@ -27,6 +27,8 @@ HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO", "DFLASH")
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
+    if get_platform().is_npu:
+        return "ascend"
     if get_platform().is_hip:
         return "tilelang"
     if get_platform().is_xpu:
@@ -35,6 +37,8 @@ def _hisparse_default_backend(kv_cache_dtype: str) -> str:
 
 
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
+    if get_platform().is_npu:
+        return {"ascend"}
     if get_platform().is_hip:
         return HISPARSE_ROCM_DSA_BACKENDS
     if get_platform().is_xpu:
@@ -85,6 +89,10 @@ def validate_hisparse_dsa_backend(
 def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 
     kv_cache_dtype = resolved_view(server_args).kv_cache_dtype
+    if get_platform().is_npu:
+        if kv_cache_dtype in ("auto", "float16", "bfloat16"):
+            return
+        raise ValueError("NPU HiSparse Host KV requires float16 or bfloat16 storage")
     if kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
         return
 
@@ -126,6 +134,20 @@ def validate_hisparse(server_args: ServerArgs) -> None:
 
     hf_config = model_config_of(server_args).hf_config
     is_v4_hisparse = is_deepseek_v4(hf_config)
+    if get_platform().is_npu:
+        from sglang.srt.hardware_backend.npu.hisparse.config import (
+            resolve_npu_hisparse_config,
+            validate_npu_hisparse,
+        )
+
+        validate_npu_hisparse(
+            cfg,
+            resolve_npu_hisparse_config(cfg),
+            hf_config,
+            is_dsa=is_deepseek_dsa(hf_config),
+            is_v4=is_v4_hisparse,
+        )
+        return
     is_m3_hisparse = is_minimax_sparse(hf_config)
     is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse or is_m3_hisparse, (

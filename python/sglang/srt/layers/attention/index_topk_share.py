@@ -51,6 +51,13 @@ class IndexTopKShareState:
         return self._topk_indices
 
     def update(self, topk_indices: Optional[torch.Tensor]) -> None:
+        # Attention has submitted the raw expanded output before layer carry.
+        # This leaves ordinary tensors and non-NPU model paths unchanged.
+        from sglang.srt.hardware_backend.npu.hisparse.planner_input import (
+            completed_selection,
+        )
+
+        topk_indices = completed_selection(topk_indices)
         if (
             topk_indices is not None
             and self.should_publish
@@ -80,6 +87,10 @@ class IndexTopKShareState:
             yield None
             return
         spec_info = forward_batch.spec_info
+        previous_plans = getattr(forward_batch, "draft_sparse_plan_cache", None)
+        forward_batch.draft_sparse_plan_cache = (
+            {} if keep_carry_seed and spec_info.dsa_topk_indices is not None else None
+        )
         forward_batch.reuse_dsa_topk_indices = True
         # Keep the draft-extend seed so step 0 reuses it; else recompute it.
         if not (keep_carry_seed and spec_info.dsa_topk_indices is not None):
@@ -87,6 +98,7 @@ class IndexTopKShareState:
         try:
             yield cls.from_mtp_carry(forward_batch)
         finally:
+            forward_batch.draft_sparse_plan_cache = previous_plans
             spec_info.dsa_topk_indices = None
             forward_batch.reuse_dsa_topk_indices = False
 
@@ -100,10 +112,14 @@ def write_mtp_seed(
     can convert prefill-only index representations (e.g. fused RAGGED logical
     offsets) into what the next draft decode consumes.
     """
+    from sglang.srt.hardware_backend.npu.hisparse.planner_input import (
+        completed_selection,
+    )
     from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
         resolve_attn_backend,
     )
 
+    topk_indices = completed_selection(topk_indices)
     select = forward_batch.spec_info.dsa_seed_topk_select
     src = topk_indices[: seed_buf.shape[0]] if select is None else topk_indices[select]
     prepare_seed = getattr(

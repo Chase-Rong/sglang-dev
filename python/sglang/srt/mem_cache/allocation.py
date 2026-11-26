@@ -27,6 +27,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_size,
     get_cp_sharded_padded_cache_transfer_indices,
 )
+from sglang.srt.managers.hisparse_factory import uses_hisparse_staging
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
@@ -374,6 +375,11 @@ def alloc_for_extend(
     batch.maybe_evict_swa()
 
     prefix_tensors = [_prefix_kv_indices(batch, r) for r in batch.reqs]
+    continuing_prefill = (
+        _is_npu
+        and batch.forward_mode == batch.forward_mode.EXTEND
+        and any(req.kv.holds_kv and req.prefix_len for req in batch.reqs)
+    )
 
     reuse_kv = None
     if batch.is_dllm():
@@ -405,7 +411,7 @@ def alloc_for_extend(
 
     # Admission already charged HiSparse scratch; allocate it with the request
     # slot so subsequent scheduling sees the remaining physical capacity.
-    if batch.hisparse_coordinator is not None:
+    if uses_hisparse_staging(batch.hisparse_coordinator):
         batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
 
     # Allocate KV cache (throws exception on failure)
@@ -534,12 +540,36 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    planner = None
     try:
+        if continuing_prefill:
+            runtime = getattr(
+                batch.hisparse_coordinator, "prefill_offload_runtime", None
+            )
+            planner = getattr(runtime, "chunk_planner", None)
+            if planner is not None:
+                from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import (
+                    get_prefill_device_pages,
+                )
+
+                ordered_pages = get_prefill_device_pages(
+                    batch, req_pool_indices_cpu, batch.seq_lens_cpu
+                )
+                planner.submit(
+                    ordered_pages,
+                    out_cache_loc,
+                    req_pool_indices_device,
+                    req_pool_indices_cpu,
+                    batch.prefix_lens,
+                    batch.seq_lens_cpu,
+                )
         batch.req_to_token_pool.alloc_aux_to_lengths(
             req_pool_indices_cpu=req_pool_indices_cpu,
             target_seq_lens_cpu=batch.seq_lens_cpu,
         )
     except Exception:
+        if planner is not None:
+            planner.discard()
         if is_cp_sharded_padded():
             out_cache_loc = physical_out_cache_loc
         storage.free_tokens(out_cache_loc)
@@ -884,7 +914,7 @@ def alloc_for_spec_decode(
                 req_to_token_pool.req_to_token, req_pool_indices, cur_kv_lens
             )
             allocator = tree_cache.token_to_kv_pool_allocator
-            if batch is not None and batch.hisparse_coordinator is not None:
+            if batch is not None and uses_hisparse_staging(batch.hisparse_coordinator):
                 # Spec decode reserves logical target slots here. Target verify
                 # later binds those slots to HiSparse's extra page; allocating
                 # target physical pages first both wastes memory and breaks the

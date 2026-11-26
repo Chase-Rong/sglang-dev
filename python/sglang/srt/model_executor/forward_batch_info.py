@@ -600,6 +600,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     attention_kv_len_lower_bound: Optional[int] = None
     # Host-side state the watermark engine seeds its next sample from.
     watermark_seed: Optional[Any] = None
+    prefill_offload_senders: Optional[List[object]] = None
+    prefill_cache_prefix_proofs: Optional[List[object]] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -615,6 +617,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Gate for reusing the first MTP draft step's indexer topk across steps;
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
+    draft_sparse_plan_cache: Optional[dict] = None
 
     minimax_m3_precached_sparse_layers: Optional[Set[int]] = None
 
@@ -939,6 +942,26 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
+    @staticmethod
+    def _prefill_cache_prefix_proofs(batch):
+        if (
+            not envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
+            or not batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+        factory = getattr(batch.tree_cache, "prefill_cache_prefix_proof", None)
+        if not callable(factory):
+            return None
+        return [
+            factory(
+                req,
+                batch.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, : req.prefix_len
+                ],
+            )
+            for req in batch.reqs
+        ]
+
     @classmethod
     def init_new(
         cls,
@@ -1100,6 +1123,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            prefill_offload_senders=(
+                [req.disagg_kv_sender for req in batch.reqs]
+                if envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
+                else None
+            ),
+            prefill_cache_prefix_proofs=cls._prefill_cache_prefix_proofs(batch),
             attention_kv_len_lower_bound=(
                 batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
             ),

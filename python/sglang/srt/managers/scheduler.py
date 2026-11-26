@@ -143,7 +143,11 @@ from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
-from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.hisparse_factory import (
+    has_pending_hisparse_transfers,
+    release_hisparse_resources,
+    uses_hisparse_staging,
+)
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -1385,7 +1389,7 @@ class Scheduler(
         )
 
     def init_hisparse_coordinator(self) -> None:
-        self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
+        self.hisparse_coordinator = None
         if not self.enable_hisparse:
             return
 
@@ -2144,9 +2148,7 @@ class Scheduler(
             self.uocr_runtime.close()
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.destroy()
-        self.tree_cache.release_host_resources()
+        release_hisparse_resources(self)
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
         destroy_global_experts_capturer()
@@ -2859,7 +2861,7 @@ class Scheduler(
             # _get_swa_token_info clamp), and pending deferred KV releases hold
             # pages out of the allocator by design.
             get_skip_idle_pool_checks=lambda: (
-                self.enable_hisparse
+                uses_hisparse_staging(self.hisparse_coordinator)
                 or (
                     self.disaggregation_mode == DisaggregationMode.DECODE
                     and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
@@ -4288,6 +4290,11 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.defer_prefill_sender_abort(
+                req, req.discard_output_reason and reason.to_json()
+            ):
+                self._pending_chunked_abort_req = None
+                return
             self.release_prefill_sender(req, abort_sender=True)
         # A client abort leaves the message to the tokenizer.
         self.request_retirer.abort(
@@ -4309,6 +4316,7 @@ class Scheduler(
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
+            hisparse_coordinator=self.hisparse_coordinator,
         )
 
         req_pool_indices = [r.kv.req_pool_idx for r in reqs]
@@ -4389,7 +4397,7 @@ class Scheduler(
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
-        if self.enable_hisparse:
+        if uses_hisparse_staging(self.hisparse_coordinator):
             ready_reqs = self.hisparse_coordinator.move_ready_reqs(self.running_reqs)
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -4402,7 +4410,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not uses_hisparse_staging(self.hisparse_coordinator)
             and last_batch
             and last_batch.forward_mode.is_extend()
         ):
@@ -4939,17 +4947,17 @@ class Scheduler(
                 break
 
         for req in unschedulable:
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # As a queued abort: the sender goes before the KV it reads.
-                self.release_prefill_sender(req, abort_sender=True)
-            self._abort_unavailable(
-                req,
-                message=(
-                    "The request cannot be scheduled: it fits the KV memory "
-                    "pool only once memory held elsewhere is freed, and "
-                    "nothing that holds memory will free it."
-                ),
+            message = (
+                "The request cannot be scheduled: it fits the KV memory "
+                "pool only once memory held elsewhere is freed, and "
+                "nothing that holds memory will free it."
             )
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                reason = FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE)
+                if self.defer_prefill_sender_abort(req, reason.to_json()):
+                    continue
+                self.release_prefill_sender(req, abort_sender=True)
+            self._abort_unavailable(req, message=message)
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
@@ -5005,6 +5013,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            hisparse_coordinator=self.hisparse_coordinator,
         )
 
         # A parked chunked request runs no chunk in this batch.
@@ -5504,6 +5513,15 @@ class Scheduler(
                     input_ids_from_graph = self.resolve_forward_inputs(
                         batch, self.future_map
                     )
+                    if (
+                        batch.forward_mode.is_decode()
+                        and self.hisparse_coordinator is not None
+                    ):
+                        warmup = getattr(
+                            self.hisparse_coordinator, "warmup_committed_requests", None
+                        )
+                        if warmup is not None:
+                            warmup(batch.reqs)
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -5689,6 +5707,15 @@ class Scheduler(
                         req.lora_id for req in self._get_all_pp_reqs()
                     }
                 self.resolve_forward_inputs(batch, self.future_map)
+                if (
+                    batch.forward_mode.is_decode()
+                    and self.hisparse_coordinator is not None
+                ):
+                    warmup = getattr(
+                        self.hisparse_coordinator, "warmup_committed_requests", None
+                    )
+                    if warmup is not None:
+                        warmup(batch.reqs)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -5778,6 +5805,12 @@ class Scheduler(
                 # released like a client abort so its next chunk never runs.
                 self._pending_chunked_abort_req = self.chunked_req
 
+        if batch.forward_mode.is_extend() and self.hisparse_coordinator is not None:
+            record = getattr(
+                self.hisparse_coordinator, "record_local_warmup_publication", None
+            )
+            if record is not None:
+                record(batch.reqs)
         self._maybe_report_active_ranks()
 
         ret.forward_launch = launch
@@ -6260,6 +6293,11 @@ class Scheduler(
                 and self.decode_offload_manager is not None
             ):
                 idle &= len(self.decode_offload_manager.ongoing_offload) == 0
+            if self.enable_hisparse and not uses_hisparse_staging(
+                self.hisparse_coordinator
+            ):
+                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+                idle &= not has_pending_hisparse_transfers(self)
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -6626,6 +6664,8 @@ class Scheduler(
             if is_prefill:
                 # A PD prefill request may hold KV its sender still reads; abort
                 # the sender before that KV is freed.
+                if self.defer_prefill_sender_abort(req, recv_req.finished_reason):
+                    continue
                 self.release_prefill_sender(req, abort_sender=True)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
