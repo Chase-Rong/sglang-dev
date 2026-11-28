@@ -119,26 +119,23 @@ def _resolve_hisparse_args(args, cfg):
             )
         hisparse.apply_environment()
         declare_resolution(args, "npu_hisparse", enable_hisparse=True)
-        if hisparse.role != "prefill" or not cfg.disable_radix_cache:
-            if (
-                cfg.enable_unified_cache_external_linker
-                or cfg.hicache_storage_backend is not None
-            ):
-                raise ValueError("NPU HiSparse requires the HiCache Host tier")
-            # Joint DSA/KDA sizing precedes the delayed decode ratio resolution
-            # in kv_cache_builder. Publish the cache-mode Host default now so
-            # budgeting and Host allocation consume the same resolved setting.
-            declare_resolution(
-                args,
-                "npu_hisparse_hicache",
-                enable_hierarchical_cache=True,
-                disable_radix_cache=False,
-                hicache_write_policy="write_through",
-                hicache_host_memory_mode="cache",
-                hicache_ratio=(2.0 if cfg.hicache_ratio is None else cfg.hicache_ratio),
-                hicache_io_backend="kernel_ascend",
-                hicache_mem_layout="page_first_kv_split",
-            )
+        if (
+            cfg.enable_unified_cache_external_linker
+            or cfg.hicache_storage_backend is not None
+        ):
+            raise ValueError("NPU HiSparse requires the HiCache Host tier")
+        # Joint DSA/KDA sizing consumes the resolved Host tier settings.
+        declare_resolution(
+            args,
+            "npu_hisparse_hicache",
+            enable_hierarchical_cache=True,
+            disable_radix_cache=False,
+            hicache_write_policy="write_through",
+            hicache_host_memory_mode="cache",
+            hicache_ratio=2.0 if cfg.hicache_ratio is None else cfg.hicache_ratio,
+            hicache_io_backend="kernel_ascend",
+            hicache_mem_layout="page_first_kv_split",
+        )
 
 
 def set_default_server_args(args: "ServerArgs"):

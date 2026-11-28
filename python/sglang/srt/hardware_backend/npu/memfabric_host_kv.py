@@ -26,9 +26,6 @@ _active_pool = None
 
 
 class MemFabricRegion(RegisteredHostRegion):
-    def export_handle(self):
-        raise RuntimeError("MemFabric shared GVA is not a SysV or PD transport handle")
-
     def close(self, *, drained=False):
         if self.closed:
             return
@@ -244,9 +241,6 @@ class MemFabricHostKvPool(NpuRegisteredHostKvPool):
         component = RegisteredHostComponent(name, region, page_size)
         self._components[name] = component
         return component
-
-    def attach_component(self, name, handle, *, page_size):
-        raise RuntimeError("MemFabric integrated Host KV uses collective allocation")
 
     @staticmethod
     def plan_prefill_rows(prefix_rows, new_rows, capacity):

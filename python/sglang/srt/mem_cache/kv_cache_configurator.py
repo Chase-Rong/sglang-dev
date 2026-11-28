@@ -2450,11 +2450,7 @@ class KVCacheConfigurator:
             fsa_pool_options,
         )
 
-        offload_options = fsa_pool_options(
-            self,
-            self.layer_info.num_effective_layers,
-            token_capacity=max_total_num_tokens,
-        )
+        offload_options = fsa_pool_options(self, self.layer_info.num_effective_layers)
         pool_cls = NPUMLATokenToKVPool
         pool_kwargs = {}
         if dsa_cp_layer_shard_rank is not None:
@@ -2903,7 +2899,7 @@ class KVCacheConfigurator:
             )
 
             extra_args["fsa_pool_kwargs"] = fsa_pool_options(
-                self, len(full_attention_layer_ids), token_capacity=max_total_num_tokens
+                self, len(full_attention_layer_ids)
             )
             if extra_args["fsa_pool_kwargs"]:
                 extra_args["max_running_requests"] = (

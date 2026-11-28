@@ -4404,7 +4404,6 @@ class HybridLinearKVPool(KVCache):
             id: i for i, id in enumerate(full_attention_layer_ids)
         }
         if fsa_pool_kwargs:
-            self.full_kv_pool.fsa_wire_layer_ids = tuple(full_attention_layer_ids)
             self.full_kv_pool.model_layer_ids = tuple(full_attention_layer_ids)
         if use_mla:
             self.mem_usage = self.get_kv_size_bytes() / GB
@@ -4447,24 +4446,6 @@ class HybridLinearKVPool(KVCache):
     @property
     def store_dtype(self):
         return self.full_kv_pool.store_dtype
-
-    def layer_receive_lease(self, *args, **kwargs):
-        lease = self.full_kv_pool.layer_receive_lease(*args, **kwargs)
-        inverse = {
-            local: global_id
-            for global_id, local in self.full_attention_layer_id_mapping.items()
-        }
-        complete = lease.visibility
-        lease.layers = {
-            inverse[layer]: region for layer, region in lease.layers.items()
-        }
-        lease.prefixes = {
-            inverse[layer]: prefix for layer, prefix in lease.prefixes.items()
-        }
-        lease.visibility = lambda layer, start, end: complete(
-            self._transfer_full_attention_id(layer), start, end
-        )
-        return lease
 
     @property
     def post_capture_active(self) -> bool:

@@ -520,7 +520,6 @@ class ModelRunner:
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
-        self.prefill_offload_adapter = None
         self.prefill_offload_runtime = None
 
         # The native overlap path replaces this during load_model(). Keep the
@@ -1250,11 +1249,6 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
-        runtime = self.prefill_offload_runtime
-        if runtime is not None and not getattr(
-            getattr(runtime, "pool", None), "integrated_offload", False
-        ):
-            capture_decode_cuda_graph = False
         is_scale_joiner = get_exec().moe.is_ep_scale_joiner and not self.is_draft_worker
         defer_decode_capture = (
             is_scale_joiner

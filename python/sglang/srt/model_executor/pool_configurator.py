@@ -25,7 +25,6 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
-    get_dsa_index_kpool_compress,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -282,7 +281,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
-        self._prefill_budget = None
         self._decode_budget = None
         self._decode_device_budget = None
         self._kvc = kvc
@@ -323,7 +321,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if (
             (kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone())
             and not kvc.is_draft_worker
-            and self._prefill_budget is None
             and self._decode_budget is None
         ):
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
@@ -449,90 +446,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
             self._decode_budget = budget_from_config(kvc, num_layers)
             return self._decode_budget.device_bytes_per_token
-        if (
-            str(kvc.device).split(":")[0] == "npu"
-            and envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
-        ):
-            from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import (
-                PrefillKvMemoryBudget,
-            )
-
-            if (
-                str(kvc.device).split(":")[0] != "npu"
-                or not kvc.use_mla_backend
-                or not is_deepseek_dsa(kvc.model_config.hf_config)
-                or get_disagg().disaggregation_mode != "prefill"
-            ):
-                raise ValueError(
-                    "bounded Prefill sizing requires an NPU DSA Prefill service"
-                )
-            if kvc.kv_cache_dtype not in (torch.bfloat16, torch.float16):
-                raise ValueError("bounded Prefill sizing requires BF16 or FP16 KV")
-            from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
-                sparse_mtp_draft_layers,
-            )
-
-            model = kvc.model_config
-            draft_layers = sparse_mtp_draft_layers(kvc)
-            element_bytes = torch._utils._element_size(kvc.kv_cache_dtype)
-            latent_bytes = (model.kv_lora_rank + model.qk_rope_head_dim) * element_bytes
-            index_bytes = model.index_head_dim * element_bytes
-            pooled_index = get_dsa_index_kpool(
-                model.hf_config
-            ) > 1 and get_dsa_index_kpool_compress(model.hf_config)
-            physical_slots = min(envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), num_layers)
-            if draft_layers:
-                physical_slots += min(
-                    envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get(), draft_layers
-                )
-            active_layers = (
-                sum(
-                    not dsa_layer_skips_topk(model.hf_config, layer)
-                    for layer in _get_dsa_cache_layer_ids(kvc, num_layers)
-                )
-                + draft_layers
-            )
-            tail_bytes = 0
-            if pooled_index:
-                requested = get_schedule().max_running_requests
-                if requested is None:
-                    raise ValueError(
-                        "Offload memory budgeting requires explicit --max-running-requests"
-                    )
-                tail_bytes = (
-                    (requested // kvc.attn_dp_size + 1)
-                    * active_layers
-                    * (
-                        get_dsa_index_kpool(model.hf_config)
-                        + (max_speculative_num_draft_tokens() or 0)
-                    )
-                    * model.index_head_dim
-                    * 4
-                )
-            self._prefill_budget = PrefillKvMemoryBudget(
-                host_bytes_per_token=(num_layers + draft_layers)
-                * (latent_bytes + (0 if pooled_index else index_bytes)),
-                device_bytes_per_token=physical_slots * latent_bytes
-                + (
-                    ceil_div(
-                        active_layers * index_bytes,
-                        get_dsa_index_kpool(model.hf_config),
-                    )
-                    if pooled_index
-                    else (num_layers + draft_layers) * index_bytes
-                ),
-                host_bytes=envs.SGLANG_NPU_PREFILL_HOST_KV_BYTES.get(),
-                device_fixed_bytes=tail_bytes,
-                host_token_capacity=envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get(),
-            )
-            from sglang.srt.hardware_backend.npu.hisparse.offload_config import (
-                _pool_host_memory_plan,
-            )
-
-            # Reserve the physical MemFabric domain before sampling sidecar
-            # headroom. P has no Decode resident/planner allocation.
-            _pool_host_memory_plan(kvc, self._prefill_budget.host_bytes)
-            return self._prefill_budget.device_bytes_per_token
         # args to config cell size
         model_config = kvc.model_config
         kv_cache_dtype = kvc.kv_cache_dtype
@@ -894,12 +807,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     "Decode budgets cannot hold selection, planner and an Indexer page"
                 )
             return MemoryPoolConfig(max_total_num_tokens=tokens)
-        if getattr(self, "_prefill_budget", None) is not None:
-            return MemoryPoolConfig(
-                max_total_num_tokens=self._prefill_budget.max_tokens(
-                    available_bytes, page_size
-                )
-            )
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
@@ -920,8 +827,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 page_size,
                 self._decode_device_budget,
             )
-        if getattr(self, "_prefill_budget", None) is not None:
-            self._prefill_budget.validate_host_capacity(max_total_num_tokens, page_size)
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 
 

@@ -61,13 +61,6 @@ class NpuHiSparseCoordinator:
         self._prefill_initialized = True
         return self.prefill_offload_runtime
 
-    def bind_prefill_runtime(self, runtime) -> None:
-        current = self.prefill_offload_runtime
-        if current is not None and current is not runtime:
-            raise RuntimeError("NPU HiSparse already has a Prefill runtime")
-        self.model_runner.prefill_offload_runtime = runtime
-        self.mem_pool_device.prefill_offload_runtime = runtime
-
     def prefill_offload_forward(self, forward_batch):
         runtime = self.prefill_offload_runtime
         if runtime is None or forward_batch.forward_mode.is_idle():
@@ -109,23 +102,6 @@ class NpuHiSparseCoordinator:
     def admit_request_into_staging(self, req) -> None:
         self.admit_request_direct(req)
 
-    def warmup_publication_committed_length(self, req):
-        """Read committed authority only for an enabled, supported owner.
-
-        Disabled PD receive keeps its existing request interface. Unknown
-        committed metadata cannot authorize a warmup publication snapshot.
-        """
-        state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
-        if (
-            state is None
-            or getattr(state, "execution_abi", None) != "shared_v3"
-            or not getattr(state, "warmup_threshold", 0)
-        ):
-            return None
-        kv = getattr(req, "kv", None)
-        committed = getattr(kv, "kv_committed_len", None)
-        return committed if type(committed) is int and committed >= 0 else None
-
     def record_local_warmup_publication(self, requests):
         """Consume a successful integrated Prefill all-layer coverage snapshot."""
         state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
@@ -151,16 +127,10 @@ class NpuHiSparseCoordinator:
                 continue
             committed = int(req.kv.kv_committed_len)
             if 0 < committed <= length:
-                self.record_warmup_publication(req, committed, publication_event=event)
+                self._record_warmup_publication(req, committed, event)
 
-    def record_warmup_publication(
-        self, req, received_committed_length, *, publication_event=None
-    ):
-        """Bind a successful PD receive publication to its exact owned prefix.
-
-        Local Prefill without this per-request coverage proof remains lazy.
-        The existing receive-success consensus covers all physical layers.
-        """
+    def _record_warmup_publication(self, req, committed_length, publication_event):
+        """Bind a completed Prefill to its exact published prefix."""
         state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
         binding = getattr(self._backing, "page_binding", None)
         if (
@@ -183,14 +153,12 @@ class NpuHiSparseCoordinator:
             [
                 int(state.generations[owner]),
                 binding.mapping_epoch,
-                received_committed_length,
+                committed_length,
                 id(req.kv),
             ],
             dtype=torch.int64,
         )
-        self._warmup_publication_events[owner] = (
-            publication_event if publication_event is not None else binding.ready_event
-        )
+        self._warmup_publication_events[owner] = publication_event
 
     def warmup_committed_requests(self, requests):
         """Scheduler-only eager boundary using authoritative Req KV snapshots.
@@ -329,21 +297,9 @@ class NpuHiSparseCoordinator:
         runtime = self.prefill_offload_runtime
         if runtime is None:
             return
-        shutdown = getattr(runtime, "drain_for_shutdown", None)
-        if shutdown is not None:
-            shutdown()
-            return
-        drain = getattr(runtime, "drain", None)
-        if drain is not None:
-            if runtime.active:
-                raise RuntimeError(
-                    "NPU Prefill generation must finish before retirement"
-                )
-            drain()
-        elif runtime.failed:
-            runtime.drain_failed_batch()
-        elif runtime.active or runtime.layers:
-            runtime.finish_batch()
+        if runtime.active:
+            raise RuntimeError("NPU Prefill generation must finish before retirement")
+        runtime.drain()
 
     def _retire_request(self, req) -> None:
         slot = req.kv.req_pool_idx
@@ -361,10 +317,6 @@ class NpuHiSparseCoordinator:
             and previous.slot == slot
         ):
             return
-        runtime = self.prefill_offload_runtime
-        if runtime is not None and hasattr(runtime, "can_release_request"):
-            if not runtime.can_release_request(req.rid):
-                raise RuntimeError("NPU Prefill request still has in-flight work")
         fsa_state = getattr(self.mem_pool_device, "fsa_runtime_state", None)
         external_resident = getattr(fsa_state, "external_resident", None)
         if external_resident is not None:
@@ -401,14 +353,6 @@ class NpuHiSparseCoordinator:
         req.hisparse_staging = False
 
     def release_request(self, req) -> None:
-        from sglang.srt.runtime_context import get_disagg
-
-        disagg = get_disagg()
-        if (
-            disagg.disaggregation_mode == "decode"
-            and not disagg.disaggregation_decode_enable_radix_cache
-        ):
-            req.skip_radix_cache_insert = True
         self._retire_request(req)
 
     def get_token_stats(self):
@@ -440,8 +384,5 @@ class NpuHiSparseCoordinator:
             if backing.hicache_pool is not None:
                 backing.hicache_pool.destroy()
             backing.pool.close(drained=True)
-        runtime = self.prefill_offload_runtime
-        if runtime is not None and hasattr(runtime, "adapter"):
-            runtime.adapter.close(drained=True)
         self._retired_requests.clear()
         self._destroyed = True

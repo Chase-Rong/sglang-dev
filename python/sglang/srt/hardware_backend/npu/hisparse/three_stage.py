@@ -96,8 +96,6 @@ def build_three_stage_inputs(state, **args):
             workspace=ws,
             logical_topk=logical,
             kv_lengths=lengths,
-            host_tokens=full.shape[0] * 128,
-            defer_execution=True,
             input_selection=selection,
         )
         plan.builtin_metadata = (

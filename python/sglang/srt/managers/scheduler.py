@@ -144,7 +144,6 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_factory import (
-    has_pending_hisparse_transfers,
     release_hisparse_resources,
     uses_hisparse_staging,
 )
@@ -4290,11 +4289,6 @@ class Scheduler(
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            if self.defer_prefill_sender_abort(
-                req, req.discard_output_reason and reason.to_json()
-            ):
-                self._pending_chunked_abort_req = None
-                return
             self.release_prefill_sender(req, abort_sender=True)
         # A client abort leaves the message to the tokenizer.
         self.request_retirer.abort(
@@ -4947,17 +4941,17 @@ class Scheduler(
                 break
 
         for req in unschedulable:
-            message = (
-                "The request cannot be scheduled: it fits the KV memory "
-                "pool only once memory held elsewhere is freed, and "
-                "nothing that holds memory will free it."
-            )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                reason = FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE)
-                if self.defer_prefill_sender_abort(req, reason.to_json()):
-                    continue
+                # As a queued abort: the sender goes before the KV it reads.
                 self.release_prefill_sender(req, abort_sender=True)
-            self._abort_unavailable(req, message=message)
+            self._abort_unavailable(
+                req,
+                message=(
+                    "The request cannot be scheduled: it fits the KV memory "
+                    "pool only once memory held elsewhere is freed, and "
+                    "nothing that holds memory will free it."
+                ),
+            )
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
@@ -6297,7 +6291,6 @@ class Scheduler(
                 self.hisparse_coordinator
             ):
                 idle &= not self.hisparse_coordinator.has_ongoing_staging()
-                idle &= not has_pending_hisparse_transfers(self)
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -6664,8 +6657,6 @@ class Scheduler(
             if is_prefill:
                 # A PD prefill request may hold KV its sender still reads; abort
                 # the sender before that KV is freed.
-                if self.defer_prefill_sender_abort(req, recv_req.finished_reason):
-                    continue
                 self.release_prefill_sender(req, abort_sender=True)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.

@@ -132,8 +132,10 @@ For GPU deployments, enable HiSparse on the decode instance of a PD deployment.
 
 On an Ascend 950 system with CANN 9.3, install MemFabric and an
 `sgl-kernel-npu` wheel built with `--arch-version 3510 --with-hisparse`.
-The integrated service keeps full KV in host memory, uses bounded device
-buffers for prefill, and loads selected KV into device memory during decode.
+Run prefill and decode in the same SGLang instance with
+`--disaggregation-mode null` (the default). The service keeps full KV in host
+memory, uses bounded device buffers for eager prefill, and loads selected KV
+into device memory during decode.
 Set an explicit host KV budget in bytes and a maximum number of running requests.
 
 ```bash Command
@@ -141,7 +143,7 @@ python3 -m sglang.launch_server \
     --model-path "$MODEL_PATH" --trust-remote-code \
     --device npu --tp-size 8 --attention-backend ascend \
     --dtype bfloat16 --kv-cache-dtype bfloat16 --max-running-requests 10 \
-    --disable-prefill-cuda-graph --enable-hisparse \
+    --disable-prefill-cuda-graph --enable-hisparse --enable-hierarchical-cache \
     --hisparse-config '{"npu":{"decode_host_kv_bytes":137438953472}}'
 ```
 
@@ -152,12 +154,6 @@ across query routes, maps them into a request's resident KV buffer, and runs
 fused sparse attention. The operator requires BF16 queries and KV, 16 or 32
 local query heads, a 512-wide MLA latent with zero RoPE width, and 128-token
 attention pages (512 tokens per allocator page for KPool 4).
-
-For separate prefill and decode services, set
-`--disaggregation-transfer-backend ascend` on both instances. Set
-`prefill_host_kv_bytes` in the prefill instance's `npu` config and
-`decode_host_kv_bytes` in the decode instance's config. Layerwise prefill
-requires eager execution.
 
 ### Prefill Instance
 

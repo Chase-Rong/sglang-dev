@@ -25,16 +25,12 @@ def sparse_layer_ids(pool):
 
 def initialize_fsa_backend(backend, model_runner):
     from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_disagg
 
     from .config import validate_dsa_offload_backend
 
     backend.fused_sparse_state = None
     validate_dsa_offload_backend(envs.SGLANG_NPU_DSA_OFFLOAD_BACKEND.get())
-    if not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get() or (
-        get_disagg().disaggregation_mode == "prefill"
-        and envs.SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD.get()
-    ):
+    if not envs.SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION.get():
         return
     from sglang.srt.hardware_backend.npu.fsa_native import (
         SHARED_QUERY_HEADS,
@@ -256,9 +252,8 @@ def _forward_fsa(
         full_table = metadata.host_page_table
         if full_table is None:
             raise RuntimeError("Integrated FSA requires the HiCache Host page table")
-    counts = metadata.fsa_query_lens_int32
-    query_lengths = metadata.fsa_query_ends_int32
-    if counts is None or query_lengths is None:
+    query_ends = metadata.fsa_query_ends_int32
+    if query_ends is None:
         raise RuntimeError("FSA query layout must be initialized with DSA metadata")
     if q_rope is None:
         q_rope = q.new_empty((*q.shape[:-1], 0))
@@ -274,8 +269,8 @@ def _forward_fsa(
         full_rope=paged_kv_view(full_rope, backend.page_size, backend.qk_rope_head_dim),
         block_table=full_table,
         kv_lengths=lengths,
-        query_lengths=query_lengths,
-        request_slots=forward_batch.req_pool_indices[: counts.numel()],
+        query_lengths=query_ends,
+        request_slots=forward_batch.req_pool_indices[: query_ends.numel()],
         scale=layer.scaling,
         query_positions=getattr(forward_batch, "positions", None),
         mapping_epoch=mapping_epoch,

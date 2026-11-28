@@ -12,7 +12,7 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -97,7 +97,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
 
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
-            if cfg.enable_hisparse and not get_platform().is_npu:
+            if cfg.enable_hisparse:
                 raise ValueError(
                     "--disaggregation-decode-enable-radix-cache is incompatible "
                     "with --enable-hisparse"
@@ -119,14 +119,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
             logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
         else:
-            keep_radix = cfg.enable_hisparse and get_platform().is_npu
             declare_resolution(
                 server_args,
                 "handle_pd_disaggregation",
-                disable_radix_cache=not keep_radix,
+                disable_radix_cache=True,
             )
-            if not keep_radix:
-                logger.warning("Radix cache is disabled for decode server")
+            logger.warning("Radix cache is disabled for decode server")
 
         # Default the number of *extra* decode req_to_token slots reserved for
         # in-transfer (being-received-from-prefill) requests, on top of the

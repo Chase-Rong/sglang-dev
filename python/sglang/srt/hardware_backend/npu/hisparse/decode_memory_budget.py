@@ -189,54 +189,6 @@ class HostMemoryBudgetPlan:
 
 
 @dataclass(frozen=True)
-class PrefillKvMemoryBudget:
-    host_bytes_per_token: int
-    device_bytes_per_token: int
-    host_bytes: int
-    device_fixed_bytes: int = 0
-    host_token_capacity: int = 0
-
-    def __post_init__(self):
-        if (
-            min(self.host_bytes_per_token, self.device_bytes_per_token, self.host_bytes)
-            <= 0
-            or self.device_fixed_bytes < 0
-        ):
-            raise ValueError(
-                "Prefill offload requires positive storage and nonnegative fixed bytes"
-            )
-
-        if type(self.host_token_capacity) is not int or self.host_token_capacity < 0:
-            raise ValueError("Prefill Host token capacity must be nonnegative")
-
-    def max_tokens(self, device_bytes, page_size):
-        if page_size <= 0:
-            raise ValueError("page_size must be positive")
-        if self.host_token_capacity % page_size:
-            raise ValueError("Prefill Host capacity must be page aligned")
-        if (
-            self.host_token_capacity + page_size
-        ) * self.host_bytes_per_token > self.host_bytes:
-            return 0
-        rows = min(
-            max(0, device_bytes - self.device_fixed_bytes)
-            // self.device_bytes_per_token,
-            self.host_bytes // self.host_bytes_per_token,
-        )
-        return max(0, (rows // page_size - 1) * page_size)
-
-    def validate_host_capacity(self, token_count, page_size):
-        if token_count < 0 or page_size <= 0 or token_count % page_size:
-            raise ValueError("invalid Prefill capacity")
-        if self.host_token_capacity % page_size:
-            raise ValueError("Prefill Host capacity must be page aligned")
-        if (
-            max(token_count, self.host_token_capacity) + page_size
-        ) * self.host_bytes_per_token > self.host_bytes:
-            raise MemoryError("Prefill Host KV exceeds its byte budget")
-
-
-@dataclass(frozen=True)
 class DecodeKvMemoryBudget:
     """Candidate capacity budget with a baseline native_workspace_bytes value.
 
@@ -255,7 +207,6 @@ class DecodeKvMemoryBudget:
     graph_rows: int = 0
     callback_instances: int = 1
     shared_fence_bytes: int = 0
-    staging_bytes: int = 0
     rows_per_request: int = 1
     prefill_layer_slots: int = 0
     host_token_capacity: int = 0
@@ -351,10 +302,6 @@ class DecodeKvMemoryBudget:
             raise ValueError("Decode selection capacity is outside the fused plan ABI")
         if self.graph_rows < 0 or self.shared_fence_bytes < 0:
             raise ValueError("invalid graph capacity or shared fence size")
-        if self.staging_bytes < 0 or self.staging_bytes % 32:
-            raise ValueError(
-                "Decode staging budget must be nonnegative and 32-byte aligned"
-            )
         if self.rows_per_request <= 0:
             raise ValueError("Decode query rows per request must be positive")
         if not 0 <= self.prefill_layer_slots <= self.layers:
@@ -500,7 +447,6 @@ class DecodeKvMemoryBudget:
             + snapshots
             + temporary
             + self.shared_fence_bytes
-            + self.staging_bytes
             + self.allocation_overhead(request_rows),
         )
 
@@ -745,9 +691,6 @@ def budget_from_config(kvc, layers):
     from sglang.srt.hardware_backend.npu.hisparse.config import (
         resolve_fsa_execution_abi,
     )
-    from sglang.srt.hardware_backend.npu.hisparse.offload_config import (
-        layer_staging_bytes,
-    )
     from sglang.srt.hardware_backend.npu.hisparse.speculative_sparse import (
         sparse_mtp_draft_layers,
         sparse_mtp_rows,
@@ -759,10 +702,9 @@ def budget_from_config(kvc, layers):
         str(kvc.device).split(":")[0] != "npu"
         or not kvc.use_mla_backend
         or not is_deepseek_dsa(kvc.model_config.hf_config)
-        or get_disagg().disaggregation_mode
-        != ("null" if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get() else "decode")
+        or get_disagg().disaggregation_mode != "null"
     ):
-        raise ValueError("registered Decode sizing requires an NPU DSA Decode service")
+        raise ValueError("registered Decode sizing requires integrated NPU DSA")
     if kvc.kv_cache_dtype != torch.bfloat16 or kvc.model_dtype != torch.bfloat16:
         raise ValueError("external_plan requires BF16 query and KV storage")
     model = kvc.model_config
@@ -794,12 +736,8 @@ def budget_from_config(kvc, layers):
             * 2
             * 2
         )
-    prefill_slots = 0
-    if envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get():
-        configured_slots = envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get()
-        prefill_slots = min(configured_slots, layers) + min(
-            configured_slots, draft_layers
-        )
+    configured_slots = envs.SGLANG_NPU_PREFILL_LAYER_SLOTS.get()
+    prefill_slots = min(configured_slots, layers) + min(configured_slots, draft_layers)
     rows_per_request = sparse_mtp_rows(kvc.spec_algorithm, get_spec(), model)
     expanded_topk = int(model.hf_text_config.index_topk) + index_kpool - 1
     configured_capacity = envs.SGLANG_NPU_FSA_RESIDENT_CAPACITY.get()
@@ -812,18 +750,10 @@ def budget_from_config(kvc, layers):
     )
     layers += draft_layers
     external_request_capacity = 0
-    external_request_extra_slots = 0
     pool = getattr(kvc, "req_to_token_pool", None)
     generation = getattr(pool, "req_generation", None)
     if generation is not None:
         external_request_capacity = int(generation.numel())
-    disagg = get_disagg()
-    if disagg.disaggregation_mode == "decode" or getattr(
-        disagg, "enable_pd_role_switch", False
-    ):
-        external_request_extra_slots = (
-            getattr(disagg, "disaggregation_decode_extra_slots", 0) or 0
-        )
     graph_config = get_exec().graph.cuda_graph_config.decode
     graph_sizes = () if graph_config.backend == "disabled" else (graph_config.bs or ())
     graph_rows = max(graph_sizes, default=0)
@@ -873,12 +803,6 @@ def budget_from_config(kvc, layers):
         )
         + 1,
         shared_fence_bytes=4 if envs.SGLANG_NPU_SHARED_HOST_KV.get() else 0,
-        staging_bytes=layer_staging_bytes(
-            envs.SGLANG_NPU_LAYER_STAGING_BYTES.get(),
-            role=get_disagg().disaggregation_mode,
-            host_offload=envs.SGLANG_NPU_DECODE_HOST_KV_BYTES.get() > 0,
-            integrated=envs.SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD.get(),
-        ),
         rows_per_request=rows_per_request,
         prefill_layer_slots=prefill_slots,
         host_token_capacity=(envs.SGLANG_NPU_HICACHE_HOST_TOKENS.get()),
@@ -903,6 +827,5 @@ def budget_from_config(kvc, layers):
         host_index_sidecar=index_kpool > 1
         and get_dsa_index_kpool_compress(model.hf_config),
         external_request_capacity=external_request_capacity,
-        external_request_extra_slots=external_request_extra_slots,
         external_resident_instances=1 + int(draft_layers > 0),
     )

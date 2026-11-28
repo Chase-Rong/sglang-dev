@@ -38,7 +38,6 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     )
     real_page_table: Optional[torch.Tensor] = None  # [B, Pkv], int32
 
-    fsa_query_lens_int32: Optional[torch.Tensor] = None
     fsa_query_ends_int32: Optional[torch.Tensor] = None
     host_page_table: Optional[torch.Tensor] = None
 
@@ -270,27 +269,6 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             max_seq_len += scope.last_step - self.speculative_step_id
         return max_seq_len
 
-    def _update_fsa_query_layout(self, metadata, query_lens, *, replay=False):
-        state = getattr(self, "fused_sparse_state", None)
-        if state is None:
-            metadata.fsa_query_lens_int32 = None
-            metadata.fsa_query_ends_int32 = None
-            return
-        if replay:
-            counts = metadata.fsa_query_lens_int32
-            ends = metadata.fsa_query_ends_int32
-            if (
-                counts is None
-                or ends is None
-                or (counts.shape != query_lens.shape or ends.shape != query_lens.shape)
-            ):
-                raise RuntimeError("FSA graph replay query layout differs from capture")
-            counts.copy_(query_lens)
-            ends.copy_(query_lens.cumsum(0).to(dtype=torch.int32))
-        else:
-            metadata.fsa_query_lens_int32 = query_lens.clone()
-            metadata.fsa_query_ends_int32 = query_lens.cumsum(0).to(dtype=torch.int32)
-
     def _update_host_page_table(self, metadata, page_table, *, replay=False):
         from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import (
             get_offload_backing,
@@ -349,7 +327,10 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         else:
             metadata.real_page_table = page_table
 
-        self._update_fsa_query_layout(metadata, query_lens)
+        if self.fused_sparse_state is not None:
+            # FSA covers every query row in the captured bucket. On replay the
+            # request slots change, with slot 0 marking padding.
+            metadata.fsa_query_ends_int32 = query_lens.cumsum(0, dtype=torch.int32)
         self._update_host_page_table(metadata, metadata.real_page_table)
 
         # --- prepare kpool metadata ---
@@ -414,7 +395,6 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         metadata.cache_lens_int32.copy_(cache_lens)
         metadata.real_page_table[:, : page_table.shape[1]].copy_(page_table)
 
-        self._update_fsa_query_layout(metadata, query_lens, replay=True)
         self._update_host_page_table(metadata, page_table, replay=True)
 
         # --- update kpool metadata ---

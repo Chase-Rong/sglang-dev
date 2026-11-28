@@ -35,11 +35,8 @@ def args(role="null", npu=None, **changes):
     return SimpleNamespace(**values)
 
 
-def budget(role):
-    return {
-        "prefill_host_kv_bytes" if role == "prefill" else "decode_host_kv_bytes": 1
-        << 30
-    }
+def budget():
+    return {"decode_host_kv_bytes": 1 << 30}
 
 
 def model(**changes):
@@ -64,29 +61,25 @@ def validate(server, config=None, hf=None, **changes):
     )
 
 
-@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
 @pytest.mark.parametrize("explicit", [False, True])
-def test_new_and_legacy_inputs_resolve_to_one_immutable_configuration(role, explicit):
-    npu = budget(role)
+def test_new_and_legacy_inputs_resolve_to_one_immutable_configuration(explicit):
+    npu = budget()
     if explicit:
         npu["dsa_offload_backend"] = "external_plan"
-    server = args(role, npu)
+    server = args(npu=npu)
     actual = CONFIG.resolve_npu_hisparse_config(server, {})
-    legacy = args(role, enable_hisparse=False, hisparse_config=None)
+    legacy = args(enable_hisparse=False, hisparse_config=None)
     assert CONFIG.resolve_npu_hisparse_config(legacy, actual.environment()) == actual
-    assert actual.role == role
-    assert actual.integrated == (role == "null")
-    assert actual.prefill_layerwise_offload == (role != "decode")
+    assert actual.integrated and actual.prefill_layerwise_offload
     assert actual.backend == "external_plan"
     with pytest.raises(FrozenInstanceError):
         actual.device_buffer_size = 1
 
 
-@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
-def test_flag_requires_explicit_positive_byte_budget_without_allocating(role):
+def test_flag_requires_explicit_positive_byte_budget_without_allocating():
     environment = {}
     with pytest.raises(ValueError, match="explicit positive.*Host byte budget"):
-        CONFIG.resolve_npu_hisparse_config(args(role), environment)
+        CONFIG.resolve_npu_hisparse_config(args(), environment)
     assert environment == {}
 
 
@@ -101,6 +94,18 @@ def test_non_offload_npu_is_unchanged():
     )
 
 
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_npu_hisparse_requires_integrated_service(role):
+    with pytest.raises(ValueError, match="requires --disaggregation-mode null"):
+        CONFIG.resolve_npu_hisparse_config(args(role, budget()), {})
+    assert (
+        CONFIG.resolve_npu_hisparse_config(
+            args(role, enable_hisparse=False, hisparse_config=None), {}
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize("field", list(CONFIG.ENV_FIELDS))
 def test_each_explicit_legacy_alias_accepts_equal_json_and_rejects_conflict(field):
     name, default = CONFIG.ENV_FIELDS[field]
@@ -110,7 +115,7 @@ def test_each_explicit_legacy_alias_accepts_equal_json_and_rejects_conflict(fiel
         "fused_sparse_attention": True,
         "decode_host_kv_bytes": 1 << 30,
     }.get(field, default)
-    npu = {**budget("null"), field: value}
+    npu = {**budget(), field: value}
     actual = CONFIG.resolve_npu_hisparse_config(args(npu=npu), {name: str(value)})
     assert getattr(actual, field) == value
     if type(value) is bool:
@@ -124,9 +129,7 @@ def test_each_explicit_legacy_alias_accepts_equal_json_and_rejects_conflict(fiel
 
 
 def test_unset_legacy_defaults_do_not_override_json_and_export_is_explicit():
-    server = args(
-        npu={**budget("null"), "prefill_layer_slots": 3, "shared_host_kv": False}
-    )
+    server = args(npu={**budget(), "prefill_layer_slots": 3, "shared_host_kv": False})
     server.hisparse_config.update(device_buffer_size=8192, host_to_device_ratio=999)
     environment = {}
     actual = CONFIG.resolve_npu_hisparse_config(server, environment)
@@ -142,11 +145,9 @@ def test_unset_legacy_defaults_do_not_override_json_and_export_is_explicit():
 def test_cli_json_string_preserves_all_budget_inputs():
     server = args(
         npu={
-            **budget("null"),
+            **budget(),
             "hicache_host_tokens": 131072,
             "prefill_layer_slots": 1,
-            "layer_staging_bytes": 4096,
-            "prefill_layer_timeout_s": 45,
         }
     )
     original = CONFIG.resolve_npu_hisparse_config(server, {})
@@ -157,7 +158,7 @@ def test_cli_json_string_preserves_all_budget_inputs():
 
 
 def test_top_level_resident_input_conflicts_identify_both_sources():
-    server = args(npu={**budget("null"), "device_buffer_size": 8192})
+    server = args(npu={**budget(), "device_buffer_size": 8192})
     server.hisparse_config["device_buffer_size"] = 4096
     with pytest.raises(ValueError, match="device_buffer_size conflicts"):
         CONFIG.resolve_npu_hisparse_config(server, {})
@@ -171,16 +172,7 @@ def test_top_level_resident_input_conflicts_identify_both_sources():
 def test_npu_json_does_not_silently_enable_an_omitted_flag():
     with pytest.raises(ValueError, match="requires --enable-hisparse"):
         CONFIG.resolve_npu_hisparse_config(
-            args(npu=budget("null"), enable_hisparse=False), {}
-        )
-
-
-@pytest.mark.parametrize("role", ["prefill", "decode"])
-def test_pd_roles_reject_budgets_from_the_other_service(role):
-    with pytest.raises(ValueError, match="different services|Prefill Host byte budget"):
-        CONFIG.resolve_npu_hisparse_config(
-            args(role, {"prefill_host_kv_bytes": 4096, "decode_host_kv_bytes": 4096}),
-            {},
+            args(npu=budget(), enable_hisparse=False), {}
         )
 
 
@@ -200,18 +192,15 @@ def test_malformed_json_and_non_object_config_fail(raw):
         ({"prefill_layer_slots": 0}, "positive"),
         ({"prefill_layer_slots": 1.5}, "expected int"),
         ({"shared_host_kv": "false"}, "expected bool"),
-        ({"layer_staging_bytes": 33}, "32-byte"),
-        ({"prefill_layer_timeout_s": float("nan")}, "finite"),
-        ({"prefill_layer_timeout_s": 0}, "positive"),
         ({"dsa_offload_backend": "cuda"}, "external_plan"),
         ({"fused_sparse_attention_mode": "reference"}, "requires.*fused"),
-        ({"integrated": False}, "role=null"),
-        ({"fused_sparse_attention": False}, "role=null"),
+        ({"integrated": False}, "integrated NPU HiSparse"),
+        ({"fused_sparse_attention": False}, "integrated NPU HiSparse"),
     ],
 )
 def test_invalid_fields_are_rejected_before_export(npu, match):
     with pytest.raises(ValueError, match=match):
-        CONFIG.resolve_npu_hisparse_config(args(npu={**budget("null"), **npu}), {})
+        CONFIG.resolve_npu_hisparse_config(args(npu={**budget(), **npu}), {})
 
 
 @pytest.mark.parametrize(
@@ -219,25 +208,23 @@ def test_invalid_fields_are_rejected_before_export(npu, match):
     [
         ("SGLANG_NPU_SHARED_HOST_KV", "maybe"),
         ("SGLANG_NPU_DECODE_HOST_KV_BYTES", "lots"),
-        ("SGLANG_NPU_PREFILL_LAYER_TIMEOUT_S", "nan"),
     ],
 )
 def test_invalid_legacy_values_are_errors_not_silent_defaults(name, value):
     with pytest.raises(ValueError):
-        CONFIG.resolve_npu_hisparse_config(args(npu=budget("null")), {name: value})
+        CONFIG.resolve_npu_hisparse_config(args(npu=budget()), {name: value})
 
 
-@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
 @pytest.mark.parametrize("legacy", [False, True])
-def test_other_backend_is_rejected_at_startup(role, legacy):
-    npu = budget(role)
+def test_other_backend_is_rejected_at_startup(legacy):
+    npu = budget()
     env = {}
     if legacy:
         env["SGLANG_NPU_DSA_OFFLOAD_BACKEND"] = "lim_copy_sfa"
     else:
         npu["dsa_offload_backend"] = "lim_copy_sfa"
     with pytest.raises(ValueError, match="requires external_plan"):
-        CONFIG.resolve_npu_hisparse_config(args(role, npu), env)
+        CONFIG.resolve_npu_hisparse_config(args(npu=npu), env)
 
 
 @pytest.mark.parametrize(
@@ -250,7 +237,7 @@ def test_other_backend_is_rejected_at_startup(role, legacy):
 )
 def test_external_plan_rejects_unsupported_execution_settings(fields, match):
     with pytest.raises(ValueError, match=match):
-        validate(args(npu={**budget("null"), **fields}))
+        validate(args(npu={**budget(), **fields}))
 
 
 def test_external_plan_initializes_with_only_the_fsa_loader(monkeypatch):
@@ -317,48 +304,6 @@ def test_external_plan_initializes_with_only_the_fsa_loader(monkeypatch):
     assert backend.fused_sparse_state.row_capacity == 4
 
 
-@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
-def test_role_specific_cache_contracts(role):
-    server = args(role, budget(role))
-    validate(server)
-    server.disable_radix_cache = not server.disable_radix_cache
-    with pytest.raises(ValueError, match="radix"):
-        validate(server)
-
-
-def test_pd_prefill_radix_uses_hicache_without_integrated_impersonation():
-    server = args(
-        "prefill",
-        budget("prefill"),
-        disable_radix_cache=False,
-        enable_hierarchical_cache=True,
-    )
-    config = CONFIG.resolve_npu_hisparse_config(server, {})
-    assert not config.integrated and config.prefill_layerwise_offload
-    validate(server, config)
-
-
-@pytest.mark.parametrize(
-    "changes,hf,match",
-    [
-        ({"enable_hierarchical_cache": False}, None, "HiCache"),
-        ({}, model(index_kpool=1), "compressed|Unified"),
-        ({}, model(index_kpool_compress=False), "compressed|Unified"),
-        ({"hicache_storage_backend": "mooncake"}, None, "Host tier"),
-        ({"enable_unified_cache_external_linker": True}, None, "Host tier"),
-    ],
-)
-def test_pd_prefill_radix_rejects_unsupported_backing_or_indexer(changes, hf, match):
-    values = dict(disable_radix_cache=False, enable_hierarchical_cache=True)
-    values.update(changes)
-    with pytest.raises(ValueError, match=match):
-        validate(args("prefill", budget("prefill"), **values), hf=hf)
-
-
-def test_ordinary_radix_disabled_prefill_keeps_uncompressed_indexer():
-    validate(args("prefill", budget("prefill")), hf=model(index_kpool=1))
-
-
 @pytest.mark.parametrize(
     "changes,match",
     [
@@ -370,6 +315,7 @@ def test_ordinary_radix_disabled_prefill_keeps_uncompressed_indexer():
         ({"enable_unified_cache_external_linker": True}, "Host tier"),
         ({"hicache_storage_backend": "mooncake"}, "Host tier"),
         ({"enable_hierarchical_cache": False}, "HiCache"),
+        ({"disable_radix_cache": True}, "radix"),
         ({"enable_mixed_chunk": True}, "CP1/DCP1"),
         ({"attn_cp_size": 2}, "CP1/DCP1"),
         ({"dcp_size": 2}, "CP1/DCP1"),
@@ -406,55 +352,37 @@ def test_ordinary_radix_disabled_prefill_keeps_uncompressed_indexer():
 )
 def test_existing_unsupported_service_combinations_still_fail(changes, match):
     with pytest.raises(ValueError, match=match):
-        validate(args(npu=budget("null"), **changes))
+        validate(args(npu=budget(), **changes))
 
 
 @pytest.mark.parametrize("steps", [1, 3, 5])
 def test_fixed_chain_mtp_and_larger_resident_inputs_are_accepted(steps):
     validate(
         args(
-            npu={**budget("null"), "device_buffer_size": 8192},
+            npu={**budget(), "device_buffer_size": 8192},
             speculative_algorithm="NEXTN",
             speculative_num_steps=steps,
         )
     )
 
 
-def test_prefill_replicated_cp_is_not_subject_to_integrated_cp1():
-    validate(args("prefill", budget("prefill"), attn_cp_size=4))
-    with pytest.raises(ValueError, match="DCP=1"):
-        validate(args("prefill", budget("prefill"), dcp_size=2))
-
-
 def test_external_plan_accepts_uncompressed_topk1024():
     server = args(
-        npu={**budget("null"), "dsa_offload_backend": "external_plan"}, page_size=128
+        npu={**budget(), "dsa_offload_backend": "external_plan"}, page_size=128
     )
     server.hisparse_config["top_k"] = 1024
     validate(server, hf=model(index_topk=1024, index_kpool=1))
 
 
-@pytest.mark.parametrize("role", ["null", "prefill"])
 @pytest.mark.parametrize("backend", ["full", "breakable"])
-def test_layerwise_prefill_rejects_captured_prefill(role, backend):
+def test_layerwise_prefill_rejects_captured_prefill(backend):
     graph = SimpleNamespace(prefill=SimpleNamespace(backend=backend))
     with pytest.raises(ValueError, match="Prefill graph capture"):
-        validate(args(role, budget(role), cuda_graph_config=graph))
-
-
-def test_npu_layer_staging_rejects_generic_host_receive():
-    with pytest.raises(ValueError, match="generic Host receive"):
-        validate(
-            args(
-                "decode",
-                budget("decode"),
-                disaggregation_decode_host_receive_threshold=0.5,
-            )
-        )
+        validate(args(npu=budget(), cuda_graph_config=graph))
 
 
 def test_topk_is_model_index_units_and_not_expanded_kpool_tokens():
-    server = args(npu=budget("null"))
+    server = args(npu=budget())
     server.hisparse_config["top_k"] = 2051
     with pytest.raises(ValueError, match="before KPool expansion"):
         validate(server)
@@ -464,13 +392,13 @@ def test_topk_is_model_index_units_and_not_expanded_kpool_tokens():
 
 
 def test_glm53_nope_uses_effective_model_kv_geometry():
-    validate(args(npu=budget("null")), hf=model(qk_rope_head_dim=64, use_mla_nope=True))
+    validate(args(npu=budget()), hf=model(qk_rope_head_dim=64, use_mla_nope=True))
 
 
 @pytest.mark.parametrize("is_dsa,is_v4", [(False, False), (False, True), (True, True)])
 def test_npu_dsv4_and_non_dsa_are_not_blanket_waived(is_dsa, is_v4):
     with pytest.raises(ValueError, match="DeepSeek V4 is unsupported"):
-        validate(args(npu=budget("null")), is_dsa=is_dsa, is_v4=is_v4)
+        validate(args(npu=budget()), is_dsa=is_dsa, is_v4=is_v4)
 
 
 if __name__ == "__main__":

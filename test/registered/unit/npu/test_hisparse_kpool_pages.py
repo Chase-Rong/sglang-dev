@@ -1,8 +1,6 @@
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
 
-import pytest
 import torch
 
 from sglang.srt.hardware_backend.npu.hicache_indexer_mapping import (
@@ -16,12 +14,7 @@ from sglang.srt.hardware_backend.npu.hisparse.decode_memory_budget import (
     DecodeKvMemoryBudget,
 )
 from sglang.srt.hardware_backend.npu.hisparse.hicache_offload import OffloadPageBinding
-from sglang.srt.hardware_backend.npu.hisparse.prefill_offload import CachePrefixProof
-from sglang.srt.hardware_backend.npu.hisparse.prefill_offload_runtime import (
-    NpuPrefillOffloadRuntime,
-)
 from sglang.srt.mem_cache.device_pool_info import MLABufferInfo, MLASplitBuffers
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -134,73 +127,3 @@ def test_budget_uses_allocator_pages_for_kv_and_attention_pages_for_the_planner(
     assert budget.device_bytes_per_token == 2 * 128 * 2 // 4
     # Two live allocator pages and page zero, each with 128 compressed keys per layer.
     assert budget.host_indexer_bytes(1024, 512) == 3 * 2 * 128 * 128 * 2
-
-
-def test_prefill_borrows_one_complete_kpool_page_for_shared_prefix():
-    size = 512
-    pool = SimpleNamespace(
-        page_size=size,
-        physical_page_size=128,
-        index_kpool=4,
-        kpool_use_compress=True,
-        device="cpu",
-        start_layer=0,
-        layer_num=1,
-        prefill_layer_slots=1,
-    )
-    backing = SimpleNamespace(pool=SimpleNamespace(), pages=8)
-    host_pages = torch.tensor([6, 2, 5])
-    host = SimpleNamespace(
-        page_size=size,
-        page_num=backing.pages,
-        device_pool=pool,
-        backing=backing,
-        available_size=lambda: size * len(host_pages),
-        alloc=lambda count: (host_pages[:, None] * size + torch.arange(size)).reshape(
-            count
-        ),
-    )
-    binding = OffloadPageBinding(host, "cpu", 4)
-    assert binding.ensure_pages(torch.tensor([1, 2, 3]))
-    backing.page_binding = binding
-    pool.decode_host_backing = backing
-
-    shared_rows = torch.arange(size, 2 * size)
-    table = torch.zeros(3, size + 1, dtype=torch.int32)
-    table[1:, :size] = shared_rows
-    table[1:, size] = torch.tensor([2 * size, 3 * size])
-    runtime = NpuPrefillOffloadRuntime(
-        pool,
-        SimpleNamespace(req_to_token=table),
-        SimpleNamespace(host_pool=host),
-        publish=None,
-    )
-    proof = CachePrefixProof(
-        namespace=("test",),
-        token_ids=tuple(range(size)),
-        device_rows=tuple(shared_rows.tolist()),
-        shared_prefix_len=size,
-        shared_group_size=size,
-    )
-    batch = SimpleNamespace(
-        forward_mode=ForwardMode.EXTEND,
-        rids=["a", "b"],
-        seq_lens_cpu=[size + 1] * 2,
-        extend_prefix_lens_cpu=[size] * 2,
-        req_pool_indices=torch.tensor([1, 2]),
-        prefill_offload_senders=[Mock(), Mock()],
-        prefill_cache_prefix_proofs=[replace(proof, shared_group_size=128)] * 2,
-    )
-    with pytest.raises(ValueError, match="incomplete"):
-        runtime.begin_batch(batch)
-    assert not binding.mapping_leases.any()
-
-    batch.prefill_cache_prefix_proofs = [proof, proof]
-    runtime.begin_batch(batch)
-    first, second = runtime.requests
-    assert first.allocation.page_ids == (6, 2) and second.allocation.page_ids == (6, 5)
-    assert first.row_plans[0].tolist() == [[6 * size, size, size]]
-    assert second.row_plans[0].numel() == 0
-    assert first.row_plans[1].tolist() == [[2 * size, 2 * size, 1]]
-    assert second.row_plans[1].tolist() == [[3 * size, 5 * size, 1]]
-    assert binding.mapping_leases.tolist() == [0, 2, 1, 1]

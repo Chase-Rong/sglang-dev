@@ -1,17 +1,9 @@
 """HiCache ownership and device-to-Host page views for sparse offload."""
 
 from collections import deque
-from dataclasses import dataclass
 from threading import RLock
 
 import torch
-
-
-@dataclass(frozen=True)
-class MappedPageBorrow:
-    device_pages: torch.Tensor
-    host_pages: torch.Tensor
-    host_generations: torch.Tensor
 
 
 class DraftHostTableScope:
@@ -63,8 +55,6 @@ class OffloadPageBinding:
         self.references = torch.zeros(host_pool.page_num, dtype=torch.int64)
         self.cache_references = torch.zeros_like(self.references)
         self.host_generations = torch.zeros_like(self.references)
-        self.mapping_leases = torch.zeros(device_pages, dtype=torch.int64)
-        self._mapping_borrows = {}
         self.retired = deque()
         self.ready_event = None
         self.reader_events = deque()
@@ -251,48 +241,6 @@ class OffloadPageBinding:
                 rows // self.page_size
             ] * self.page_size + rows.remainder(self.page_size)
 
-    def pin_transfer_pages(self, device_pages):
-        with self.lock:
-            pages = torch.as_tensor(device_pages, dtype=torch.int64, device="cpu")
-            self._validate_device_pages(pages)
-            host_pages = self.device_to_host_cpu[pages].clone()
-            if (host_pages <= 0).any():
-                raise RuntimeError("PD transfer requires allocated Host pages")
-            self.references.index_add_(0, host_pages, torch.ones_like(host_pages))
-            return host_pages
-
-    def borrow_mapped_pages(self, device_pages):
-        """Atomically pin Host storage and lease the allocator's device identities."""
-        with self.lock:
-            self.check_reader_health()
-            pages = torch.as_tensor(
-                device_pages, dtype=torch.int64, device="cpu"
-            ).clone()
-            self._validate_device_pages(pages)
-            host = self.device_to_host_cpu[pages].clone()
-            if (host <= 0).any():
-                raise RuntimeError("Prefill borrow requires mapped Host pages")
-            unique = pages.unique()
-            pinned = self.device_to_host_cpu[unique].clone()
-            self.references.index_add_(0, pinned, torch.ones_like(pinned))
-            self.mapping_leases[unique] += 1
-            borrow = MappedPageBorrow(pages, host, self.host_generations[host].clone())
-            self._mapping_borrows[id(borrow)] = (borrow, unique, pinned)
-            return borrow
-
-    def release_borrow(self, borrow):
-        with self.lock:
-            current, pages, pinned = self._mapping_borrows[id(borrow)]
-            if current is not borrow:
-                raise ValueError("unknown mapping borrow")
-            self._release(pinned)
-            self.mapping_leases[pages] -= 1
-            del self._mapping_borrows[id(borrow)]
-
-    def _check_mapping_leases(self, pages):
-        if self.mapping_leases[pages].any():
-            raise RuntimeError("device mapping has an active Prefill lease")
-
     def pin_host_rows(self, rows):
         with self.lock:
             pages = torch.unique(self._complete_pages(rows))
@@ -362,7 +310,6 @@ class OffloadPageBinding:
             self.check_reader_health()
             pages = torch.unique(pages.detach().to(device="cpu", dtype=torch.int64))
             self._validate_device_pages(pages)
-            self._check_mapping_leases(pages)
             for reader in self.reader_events:
                 torch.npu.current_stream().wait_event(reader)
             host_pages = self.device_to_host_cpu[pages]
@@ -390,7 +337,6 @@ class OffloadPageBinding:
                 raise RuntimeError("HiCache restore names unowned Host memory")
             old_pages = self.device_to_host_cpu[device_pages]
             changed = old_pages != host_pages
-            self._check_mapping_leases(device_pages[changed])
             self.references.index_add_(
                 0, host_pages[changed], torch.ones_like(host_pages[changed])
             )
@@ -400,7 +346,6 @@ class OffloadPageBinding:
     def clear(self):
         with self.lock:
             self.check_reader_health()
-            self._check_mapping_leases(torch.arange(self.mapping_leases.numel()))
             if self.references.any() or self.retired or self.reader_events:
                 torch.npu.synchronize()
                 if self.shared_group is not None:
@@ -433,28 +378,3 @@ def bind_draft_page_ownership(allocator, draft_pool):
         raise ValueError("NPU draft and target must share Host page ownership")
     host = target_backing.bind_hicache(target_pool)
     host.attach_mtp_drafts((draft_pool,))
-
-
-def publish_received_host_kv(layer_pool):
-    """Record local readiness after the TP receive-success consensus.
-
-    Staging ACKs already wait for Host writes and receiver visibility, and
-    the scheduler MIN-reduces lease readiness across TP before calling here.
-    Another HCCL broadcast on the scheduling stream can interleave with
-    model collectives replayed on the forward stream.
-    """
-    backings = getattr(layer_pool, "host_backings", None)
-    if backings is None:
-        pool = getattr(layer_pool, "full_kv_pool", layer_pool)
-        backings = (pool.decode_host_backing,)
-    seen = set()
-    for backing in backings:
-        binding = backing.page_binding
-        if binding is None:
-            raise RuntimeError("PD receive requires HiCache page ownership")
-        if id(binding) in seen:
-            continue
-        seen.add(id(binding))
-        event = torch.npu.Event()
-        event.record(torch.npu.current_stream())
-        binding.ready_event = event

@@ -11,21 +11,6 @@ def operations(resident):
     return resident._native_lifecycle
 
 
-def preflight(planner, physical, ends, owners, generations, cacheable):
-    keys, ends, owners = planner._input_tensors(
-        physical, ends, owners, cacheable, boundary_dtype=torch.int32
-    )
-    prepared = torch.empty_like(owners)
-    selected_generations = torch.empty_like(owners)
-    operations(planner.resident).shared_adapter_preflight(
-        [keys, ends, owners, generations, planner.resident.lifecycle_error],
-        [prepared, selected_generations],
-        planner.max_routes,
-        1,
-    )
-    return prepared, selected_generations
-
-
 def reserve_inputs(owners, plan, logical):
     expected = torch.empty((owners.numel(), 9), dtype=torch.int64, device=owners.device)
     native_owners = torch.empty_like(owners)
@@ -33,28 +18,6 @@ def reserve_inputs(owners, plan, logical):
     native_logical = torch.empty_like(logical)
     native_union = torch.empty_like(plan.union_index)
     return [expected, native_owners, native_rows, native_logical, native_union]
-
-
-def inputs(resident, lease, owners, plan, logical, instance):
-    outputs = reserve_inputs(owners, plan, logical)
-    operations(resident).shared_adapter_inputs(
-        [
-            owners,
-            plan.row_to_request,
-            logical,
-            plan.union_index,
-            lease.active,
-            lease.generation,
-            lease.mapping_epoch,
-            lease.planner_version,
-            lease.serial,
-        ],
-        outputs,
-        instance,
-        lease.layer_id,
-        1,
-    )
-    return outputs
 
 
 def complete(resident, lease, owners, expected, completion, status, ready, counts):

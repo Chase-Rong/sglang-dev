@@ -252,18 +252,6 @@ def test_integrated_slots_add_device_capacity_without_duplicating_host():
     assert integrated.max_tokens(after[1], 128, lambda tokens: 1) == 8192
 
 
-def test_staging_reserves_one_fixed_window_and_copy_metadata():
-    baseline = budget()
-    staged = budget(staging_bytes=4096)
-    for rows in (1, 8):
-        before = baseline.required_bytes(8192, rows, 128)
-        after = staged.required_bytes(8192, rows, 128)
-        assert after[0] == before[0]
-        assert after[1] - before[1] == 4096
-    with pytest.raises(ValueError, match="staging"):
-        budget(staging_bytes=33)
-
-
 def test_solver_reserves_padding_page_and_fixed_selection_storage():
     model = budget()
     _, device_bytes = model.required_bytes(8192, 4, 128)

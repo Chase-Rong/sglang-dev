@@ -14,17 +14,6 @@ def uses_hisparse_staging(coordinator) -> bool:
     return coordinator is not None and getattr(coordinator, "uses_staging", True)
 
 
-def has_pending_hisparse_transfers(scheduler) -> bool:
-    if uses_hisparse_staging(scheduler.hisparse_coordinator):
-        return False
-    for name in ("disagg_prefill_bootstrap_queue", "disagg_decode_prealloc_queue"):
-        manager = getattr(getattr(scheduler, name, None), "kv_manager", None)
-        pending = getattr(manager, "has_pending_layer_transfers", None)
-        if pending is not None and pending():
-            return True
-    return False
-
-
 def release_hisparse_resources(scheduler):
     coordinator = scheduler.hisparse_coordinator
     if coordinator is not None and not uses_hisparse_staging(coordinator):

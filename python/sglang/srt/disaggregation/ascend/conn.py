@@ -364,13 +364,6 @@ class AscendKVManager(MooncakeKVManager):
                 for layer_id in src_entries
             ]
 
-        completed = getattr(self.kv_args, "prefill_layerwise_completed_ptrs", ())
-        if completed:
-            layers_params = [
-                p
-                for p in layers_params
-                if self.kv_args.kv_data_ptrs[p[0]] not in completed
-            ]
         kv_units = group_units(prefill_kv_blocks, dst_kv_blocks)
         local_kv_keys = self._local_keys.kv
         peer_kv_keys = self._peers[mooncake_session_id].keys.kv

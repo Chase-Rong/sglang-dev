@@ -14,7 +14,6 @@ No device imports, allocations, or environment mutations occur during parsing.
 """
 
 import json
-import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -27,11 +26,8 @@ ENV_FIELDS = {
     "device_buffer_size": ("SGLANG_NPU_FSA_RESIDENT_CAPACITY", 4096),
     "shared_host_kv": ("SGLANG_NPU_SHARED_HOST_KV", True),
     "integrated": ("SGLANG_NPU_ENABLE_INTEGRATED_OFFLOAD", False),
-    "layer_staging_bytes": ("SGLANG_NPU_LAYER_STAGING_BYTES", 0),
-    "prefill_layer_timeout_s": ("SGLANG_NPU_PREFILL_LAYER_TIMEOUT_S", 30.0),
     "prefill_layerwise_offload": ("SGLANG_NPU_ENABLE_PREFILL_LAYERWISE_OFFLOAD", False),
     "prefill_layer_slots": ("SGLANG_NPU_PREFILL_LAYER_SLOTS", 2),
-    "prefill_host_kv_bytes": ("SGLANG_NPU_PREFILL_HOST_KV_BYTES", 0),
     "decode_host_kv_bytes": ("SGLANG_NPU_DECODE_HOST_KV_BYTES", 0),
     "hicache_host_tokens": ("SGLANG_NPU_HICACHE_HOST_TOKENS", 0),
     "fused_sparse_attention": ("SGLANG_NPU_ENABLE_FUSED_SPARSE_ATTENTION", False),
@@ -41,17 +37,13 @@ ENV_FIELDS = {
 
 @dataclass(frozen=True)
 class NPUHiSparseConfig:
-    role: str
     top_k: int | None
     dsa_offload_backend: str
     device_buffer_size: int
     shared_host_kv: bool
     integrated: bool
-    layer_staging_bytes: int
-    prefill_layer_timeout_s: float
     prefill_layerwise_offload: bool
     prefill_layer_slots: int
-    prefill_host_kv_bytes: int
     decode_host_kv_bytes: int
     hicache_host_tokens: int
     fused_sparse_attention: bool
@@ -89,10 +81,7 @@ def _parse_value(value, default, source, *, environment=False):
             return type(default)(value)
         except (ValueError, TypeError, AttributeError) as error:
             raise ValueError(f"Invalid {source}: {value!r}") from error
-    valid = type(value) is type(default)
-    if type(default) is float:
-        valid = type(value) in (int, float)
-    if not valid:
+    if type(value) is not type(default):
         raise ValueError(f"Invalid {source}: expected {type(default).__name__}")
     return value
 
@@ -136,7 +125,6 @@ def resolve_npu_hisparse_config(server_args, environ=None):
     legacy = (
         values["integrated"]
         or values["prefill_layerwise_offload"]
-        or values["prefill_host_kv_bytes"] > 0
         or values["decode_host_kv_bytes"] > 0
     )
     if not enabled and not legacy:
@@ -144,6 +132,8 @@ def resolve_npu_hisparse_config(server_args, environ=None):
         if npu:
             raise ValueError("hisparse_config.npu requires --enable-hisparse")
         return None
+    if getattr(server_args, "disaggregation_mode", "null") != "null":
+        raise ValueError("NPU HiSparse requires --disaggregation-mode null")
     if str(environment.get("SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD", "0")).lower() in (
         "true",
         "1",
@@ -172,43 +162,25 @@ def resolve_npu_hisparse_config(server_args, environ=None):
         if name in environment and value != values[field]:
             raise ValueError(f"{source} conflicts with explicit {name}")
         values[field] = value
-    role = getattr(server_args, "disaggregation_mode", "null")
-    if role not in ("null", "prefill", "decode"):
-        raise ValueError(f"Unsupported NPU HiSparse service role: {role}")
-    for field, required in (
-        ("integrated", role == "null"),
-        ("prefill_layerwise_offload", role != "decode"),
-        ("fused_sparse_attention", role != "prefill"),
-    ):
-        name, default = ENV_FIELDS[field]
-        if (field in supplied or name in environment) and values[field] != required:
+    for field in ("integrated", "prefill_layerwise_offload", "fused_sparse_attention"):
+        name, _ = ENV_FIELDS[field]
+        if (field in supplied or name in environment) and not values[field]:
             raise ValueError(
                 f"hisparse_config.npu.{field} / {name} conflicts with "
-                f"NPU HiSparse role={role} (requires {required})"
+                "integrated NPU HiSparse (requires True)"
             )
-        values[field] = required
+        values[field] = True
     for field in (
         "device_buffer_size",
         "prefill_layer_slots",
-        "prefill_host_kv_bytes",
         "decode_host_kv_bytes",
         "hicache_host_tokens",
-        "layer_staging_bytes",
     ):
         if values[field] < 0:
             raise ValueError(f"NPU HiSparse {field} must be nonnegative")
     if values["device_buffer_size"] == 0 or values["prefill_layer_slots"] == 0:
         raise ValueError(
             "NPU HiSparse requires positive device_buffer_size and prefill_layer_slots"
-        )
-    if values["layer_staging_bytes"] % 32:
-        raise ValueError("NPU HiSparse layer_staging_bytes must be 32-byte aligned")
-    if (
-        not math.isfinite(values["prefill_layer_timeout_s"])
-        or values["prefill_layer_timeout_s"] <= 0
-    ):
-        raise ValueError(
-            "NPU HiSparse prefill_layer_timeout_s must be finite and positive"
         )
     validate_dsa_offload_backend(values["dsa_offload_backend"])
     values["fsa_execution_abi"] = resolve_fsa_execution_abi(values["fsa_execution_abi"])
@@ -218,25 +190,17 @@ def resolve_npu_hisparse_config(server_args, environ=None):
     )
     if values["fused_sparse_attention_mode"] != "fused":
         raise ValueError("external_plan requires fused_sparse_attention_mode=fused")
-    budget = "prefill_host_kv_bytes" if role == "prefill" else "decode_host_kv_bytes"
-    if values[budget] <= 0:
+    if values["decode_host_kv_bytes"] <= 0:
         raise ValueError(
-            f"NPU HiSparse role={role} requires an explicit positive "
-            f"hisparse_config.npu.{budget} or {ENV_FIELDS[budget][0]}; "
-            "no Host byte budget is allocated by default"
+            "NPU HiSparse requires an explicit positive Host byte budget via "
+            "hisparse_config.npu.decode_host_kv_bytes or SGLANG_NPU_DECODE_HOST_KV_BYTES"
         )
-    if role == "prefill" and values["decode_host_kv_bytes"]:
-        raise ValueError(
-            "Prefill and Decode Host byte budgets belong to different services"
-        )
-    if role == "decode" and values["prefill_host_kv_bytes"]:
-        raise ValueError("Decode cannot use a Prefill Host byte budget")
     top_k = raw.get("top_k")
     if top_k is not None and (type(top_k) is not int or top_k <= 0):
         raise ValueError("hisparse_config.top_k must be a positive integer")
     if top_k is not None and values["device_buffer_size"] < top_k:
         raise ValueError("device_buffer_size must cover top_k")
-    return NPUHiSparseConfig(role=role, top_k=top_k, **values)
+    return NPUHiSparseConfig(top_k=top_k, **values)
 
 
 def validate_npu_hisparse(server_args, config, hf_config, *, is_dsa, is_v4):
@@ -250,12 +214,10 @@ def validate_npu_hisparse(server_args, config, hf_config, *, is_dsa, is_v4):
         raise ValueError("NPU HiSparse Host KV requires float16 or bfloat16 storage")
     graph = getattr(server_args, "cuda_graph_config", None)
     prefill_graph = getattr(getattr(graph, "prefill", None), "backend", "disabled")
-    if config.prefill_layerwise_offload and prefill_graph != "disabled":
+    if prefill_graph != "disabled":
         raise ValueError(
             "NPU HiSparse layerwise Prefill requires disabled Prefill graph capture"
         )
-    if getattr(server_args, "disaggregation_decode_host_receive_threshold", 1) < 1:
-        raise ValueError("NPU HiSparse uses layer staging, not generic Host receive")
     for attr in (
         "attention_backend",
         "prefill_attention_backend",
@@ -268,42 +230,23 @@ def validate_npu_hisparse(server_args, config, hf_config, *, is_dsa, is_v4):
             raise ValueError(
                 f"NPU HiSparse uses Ascend attention, not {attr}={getattr(server_args, attr)}"
             )
-    if config.role == "prefill":
-        if getattr(server_args, "optimistic_prefill_attempts", 0):
-            raise ValueError(
-                "NPU HiSparse Prefill requires disabled optimistic Prefill"
-            )
-    if config.role != "prefill" or not getattr(
-        server_args, "disable_radix_cache", False
+    if getattr(server_args, "disable_radix_cache", False) or not getattr(
+        server_args, "enable_hierarchical_cache", False
     ):
-        if getattr(server_args, "disable_radix_cache", False) or not getattr(
-            server_args, "enable_hierarchical_cache", False
-        ):
-            raise ValueError(
-                "NPU HiSparse radix-enabled offload requires HiCache and enabled radix cache"
-            )
-        if (
-            getattr(server_args, "enable_unified_cache_external_linker", False)
-            or getattr(server_args, "hicache_storage_backend", None) is not None
-        ):
-            raise ValueError(
-                "NPU HiSparse requires the HiCache Host tier without external linker/Store"
-            )
+        raise ValueError("NPU HiSparse requires HiCache and enabled radix cache")
     if (
-        config.role != "null"
-        and getattr(server_args, "disaggregation_transfer_backend", None) != "ascend"
+        getattr(server_args, "enable_unified_cache_external_linker", False)
+        or getattr(server_args, "hicache_storage_backend", None) is not None
     ):
-        raise ValueError("NPU HiSparse PD requires the Ascend MemFabric backend")
+        raise ValueError(
+            "NPU HiSparse requires the HiCache Host tier without external linker/Store"
+        )
     cp = getattr(server_args, "attn_cp_size", 1)
     dcp = getattr(server_args, "dcp_size", getattr(server_args, "attn_dcp_size", 1))
-    if config.integrated and (
-        getattr(server_args, "enable_mixed_chunk", False) or cp != 1 or dcp != 1
-    ):
+    if getattr(server_args, "enable_mixed_chunk", False) or cp != 1 or dcp != 1:
         raise ValueError(
             "Integrated NPU HiSparse requires separate Prefill batches and CP1/DCP1"
         )
-    if config.shared_host_kv and dcp != 1:
-        raise ValueError("shared MLA Host backing requires replicated KV with DCP=1")
     algorithm = getattr(server_args, "speculative_algorithm", None)
     steps = getattr(server_args, "speculative_num_steps", None)
     if algorithm is not None and (
@@ -334,15 +277,6 @@ def validate_npu_hisparse(server_args, config, hf_config, *, is_dsa, is_v4):
         raise ValueError(
             "hisparse_config.top_k must equal model index_topk (before KPool expansion)"
         )
-    if config.role == "prefill":
-        if not getattr(server_args, "disable_radix_cache", False) and not (
-            model_value("index_kpool", 1) > 1
-            and model_value("index_kpool_compress", False)
-        ):
-            raise ValueError(
-                "radix-enabled Prefill requires the Unified compressed Indexer sidecar"
-            )
-        return
     expanded = int(model_topk) + int(model_value("index_kpool", 1)) - 1
     if config.device_buffer_size < expanded:
         raise ValueError(

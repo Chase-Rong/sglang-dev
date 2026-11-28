@@ -370,15 +370,8 @@ def reserve_shared(state, layer_id, rows, topk, full_rope, full_kv):
 
 
 def build_shared_inputs(state, **args):
-    from .fused_sparse_attention import (
-        mask_causal_topk,
-        normalize_topk,
-        translate_logical_selection,
-    )
-
     q = args["q_nope"]
     rope = args["q_rope"]
-    full = args["full_kv"]
     if (
         q.ndim != 3
         or q.shape[1] not in SHARED_QUERY_HEADS
@@ -387,132 +380,9 @@ def build_shared_inputs(state, **args):
         or rope.shape[-1] != 0
     ):
         raise ValueError("external_plan requires BF16 query H16 or H32/NoPE512/RoPE0")
-    if state.device.type == "npu":
-        from .three_stage import build_three_stage_inputs
+    from .three_stage import build_three_stage_inputs
 
-        return build_three_stage_inputs(state, **args)
-    logical = normalize_topk(args["topk_indices"])
-    rows = q.shape[0]
-    topk = logical.shape[-1]
-    if logical.shape[0] > rows or logical.shape[1] != 1:
-        raise ValueError("shared TopK shape differs from query")
-    if logical.shape[0] < rows:
-        logical = torch.cat(
-            (logical, logical.new_full((rows - logical.shape[0], 1, topk), -1))
-        )
-    ws = reserve_shared(state, args["layer_id"], rows, topk, args["full_rope"], full)
-    # This precedes epoch updates, metadata generation and resident.prepare.
-    ws.guard.acquire()
-    try:
-        capturing = (
-            state.device.type == "npu" and torch.npu.is_current_stream_capturing()
-        )
-        if capturing:
-            from .fsa_graph_lifecycle import register_capture_shared
-
-            register_capture_shared(
-                state.external_resident,
-                ws.guard,
-                None,
-                state.mapping_epoch_input,
-                (),
-                state,
-            )
-        if not capturing:
-            state.refresh_generations()
-            state.refresh_mapping_epoch(args["mapping_epoch"])
-        ends = (
-            args["query_lengths"]
-            .to(device=state.device, dtype=torch.int32)
-            .contiguous()
-        )
-        lengths = (
-            args["kv_lengths"].to(device=state.device, dtype=torch.int32).contiguous()
-        )
-        owners = (
-            args["request_slots"]
-            .to(device=state.device, dtype=torch.int64)
-            .contiguous()
-        )
-        if (
-            not 0 < owners.numel() <= ws.planner.batch_capacity
-            or owners.numel() != ends.numel()
-            or lengths.numel() != ends.numel()
-        ):
-            raise ValueError(
-                "shared batch exceeds reservation or mismatches request vectors"
-            )
-        if args["block_table"].shape[0] != ends.numel():
-            raise ValueError("shared page table must have one row per request")
-        table_input = args["block_table"].to(device=state.device)
-        bad_table = (table_input < -1) | (table_input > torch.iinfo(torch.int32).max)
-        resident = state.external_resident
-        resident._error(bad_table, 2)
-        table = table_input.masked_fill(bad_table, -1).to(torch.int32).contiguous()
-        resident._error((ends[-1] != rows).reshape(1), 2)
-        row = torch.arange(rows, device=state.device)
-        request = torch.bucketize(row, ends, right=True).clamp(max=owners.numel() - 1)
-        logical = mask_causal_topk(
-            logical, request, ends, lengths, positions=args["query_positions"]
-        )
-        reference = translate_logical_selection(
-            logical, table, lengths, ends, page_size=128
-        )
-        physical = reference.physical_token_ids[:, 0].masked_fill(
-            reference.physical_token_ids[:, 0] >= full.shape[0] * 128, -1
-        )
-        logical = logical.masked_fill(physical[:, None] < 0, -1)
-        cacheable = None
-        if state.mutable_tail_tokens:
-            cacheable = (logical[:, 0] >= 0) & (
-                logical[:, 0]
-                < (lengths[request] - state.mutable_tail_tokens).clamp_min(0)[:, None]
-            )
-        if hasattr(ws, "warmup") and cacheable is not None:
-            ws.warmup.invalidate_mutable(owners[request], logical[:, 0], cacheable)
-        prepared = ws.planner.validate_inputs(
-            physical, ends, owners, cacheable_mask=cacheable
-        )
-        resident.prepare(
-            args["layer_id"],
-            prepared,
-            state.generations[prepared.clamp(0, state.generations.numel() - 1)],
-            state.mapping_epoch_input,
-        )
-        plan = ws.planner.plan(
-            args["layer_id"],
-            physical,
-            ends,
-            owners,
-            cacheable_mask=cacheable,
-            mapping_epoch=state.mapping_epoch_input,
-            workspace=ws,
-            logical_topk=logical,
-            kv_lengths=lengths,
-            host_tokens=full.shape[0] * 128,
-        )
-        plan.execution_table = table
-        return SharedInputs(
-            q,
-            full,
-            table,
-            lengths,
-            ends,
-            logical,
-            owners,
-            plan,
-            ws,
-            state,
-            args["layer_id"],
-            args["scale"],
-            state.mapping_epoch_input,
-            load_mode=state.load_mode,
-        )
-    except Exception:
-        if not (state.device.type == "npu" and torch.npu.is_current_stream_capturing()):
-            drain_shared(ws, None)
-            ws.guard.drained()
-        raise
+    return build_three_stage_inputs(state, **args)
 
 
 def drain_streams(streams):
@@ -675,62 +545,3 @@ def run_shared(inputs, mode="fused"):
                 binding.mark_reader_failure(error)
             raise
         raise
-
-
-def storage_inventory(*objects):
-    """Actual reachable tensor storages, deduplicated by device/base allocation.
-
-    Only supplied owners are walked; request pool/backing/native allocations are
-    external references and must be supplied explicitly when desired.
-    """
-    seen_objects = set()
-    storages = {}
-    excluded = {
-        "pool",
-        "host_binding",
-        "full_kv_region",
-        "full_rope_region",
-        "device",
-        "guard",
-        "state",
-        "resident",
-        "workspace",
-    }
-
-    def walk(value, path):
-        if isinstance(value, torch.Tensor):
-            storage = value.untyped_storage()
-            key = (str(value.device), storage.data_ptr(), storage.nbytes())
-            if storage.nbytes():
-                storages.setdefault(
-                    key,
-                    {
-                        "device": str(value.device),
-                        "bytes": storage.nbytes(),
-                        "paths": [],
-                    },
-                )["paths"].append(path)
-            return
-        if id(value) in seen_objects:
-            return
-        seen_objects.add(id(value))
-        if isinstance(value, dict):
-            for k, v in value.items():
-                walk(v, f"{path}.{k}")
-        elif isinstance(value, (tuple, list)):
-            for i, v in enumerate(value):
-                walk(v, f"{path}[{i}]")
-        elif hasattr(value, "__dict__"):
-            for k, v in vars(value).items():
-                if k not in excluded:
-                    walk(v, f"{path}.{k}")
-
-    for i, obj in enumerate(objects):
-        walk(obj, f"owner[{i}]")
-    return {
-        "cpu_bytes": sum(v["bytes"] for v in storages.values() if v["device"] == "cpu"),
-        "device_bytes": sum(
-            v["bytes"] for v in storages.values() if v["device"] != "cpu"
-        ),
-        "storages": list(storages.values()),
-    }

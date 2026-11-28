@@ -1,8 +1,6 @@
 """ABI3 protected-hash planner and final consumer metadata.
 
-Only validation-before-identity-adoption remains in the reservation adapter.
-Planning and final consumer metadata are one independent SIMT kernel. Resident
-record/lease/complete and Host reader ownership retain their existing lifecycle.
+Prepare buffers for the device producer and fused V4 attention.
 """
 
 import torch
@@ -49,49 +47,6 @@ class ExternalPlanFusedPlanner(ExternalPlanReservation):
                 self.device, rows, topk, batch_capacity, self.union_width, namespace
             )
 
-    def validate_inputs(
-        self, physical_keys, query_ends, request_slots, *, cacheable_mask=None
-    ):
-        keys, ends, owners = self._input_tensors(
-            physical_keys, query_ends, request_slots, cacheable_mask
-        )
-        rows = keys.shape[0]
-        starts = torch.cat((ends.new_zeros(1), ends[:-1]))
-        malformed = ((ends < 0) | (ends > rows) | (ends < starts)).any()
-        row = torch.arange(rows, dtype=torch.long, device=self.device)
-        orphan = row >= ends[-1]
-        malformed |= (orphan[:, None] & (keys != -1)).any()
-        safe_ends = torch.cummax(ends.clamp(0, rows), dim=0).values
-        lengths = safe_ends - torch.cat((safe_ends.new_zeros(1), safe_ends[:-1]))
-        owner_valid = (owners > 0) & (owners < self.resident.request_capacity)
-        safe_owners = owners.clamp(0, self.resident.request_capacity - 1)
-        counts = torch.zeros(
-            self.resident.request_capacity, dtype=torch.int32, device=self.device
-        )
-        counts.scatter_add_(
-            0, safe_owners, (owner_valid & (lengths > 0)).to(torch.int32)
-        )
-        overflow = (
-            malformed
-            | (lengths > self.max_routes)
-            | (owner_valid & (counts[safe_owners] > 1))
-            | (owners < 0)
-            | (owners >= self.resident.request_capacity)
-        )
-        request = torch.bucketize(row, safe_ends, right=True).clamp(
-            max=owners.numel() - 1
-        )
-        key_invalid = (
-            (row < safe_ends[-1])
-            & owner_valid[request]
-            & ((keys < -1) | (keys == torch.iinfo(torch.int64).max)).any(dim=1)
-        )
-        invalid_counts = torch.zeros_like(owners, dtype=torch.int32)
-        invalid_counts.scatter_add_(0, request, key_invalid.to(torch.int32))
-        overflow |= invalid_counts > 0
-        self.resident._error(overflow, 2)
-        return owners.masked_fill(~(owner_valid & (lengths > 0) & ~overflow), 0)
-
     def plan(
         self,
         layer_id,
@@ -99,28 +54,15 @@ class ExternalPlanFusedPlanner(ExternalPlanReservation):
         query_ends,
         request_slots,
         *,
-        cacheable_mask=None,
-        mapping_epoch=0,
-        workspace=None,
-        logical_topk=None,
-        kv_lengths=None,
-        host_tokens=None,
-        defer_execution=False,
-        input_selection=None,
+        cacheable_mask,
+        mapping_epoch,
+        workspace,
+        logical_topk,
+        kv_lengths,
+        input_selection,
     ):
-        from sglang.srt.hardware_backend.npu.fsa_native import native_ops
-
-        if input_selection is not None and not defer_execution:
-            raise ValueError(
-                "raw Planner input requires deferred three-stage execution"
-            )
-        if (
-            workspace is None
-            or logical_topk is None
-            or kv_lengths is None
-            or host_tokens is None
-        ):
-            raise ValueError("FUSED planner requires final SFA metadata reservation")
+        if self.device.type != "npu":
+            raise ValueError("Deferred fused execution requires the NPU producer")
         rows, topk = physical_keys.shape
         batch = request_slots.numel()
         if not (
@@ -180,34 +122,6 @@ class ExternalPlanFusedPlanner(ExternalPlanReservation):
             self.resident.planner_version,
         ]
         cache = [] if self.topology_cache is None else list(self.topology_cache.tensors)
-        if defer_execution:
-            if self.device.type != "npu":
-                raise ValueError("deferred fused execution requires the NPU producer")
-        elif self.topology_cache is None:
-            native_ops().external_plan_prepare(
-                native_inputs,
-                native_outputs,
-                self.capacity,
-                self.max_routes,
-                int(host_tokens),
-                3,
-            )
-        else:
-            self.topology_ops.external_plan_prepare_cached(
-                native_inputs,
-                native_outputs,
-                [
-                    self.resident.generation,
-                    self.resident.mapping_epoch,
-                    self.resident.planner_version,
-                ],
-                list(self.topology_cache.tensors),
-                self.capacity,
-                self.max_routes,
-                int(host_tokens),
-                self.topology_cache.namespace,
-                1,
-            )
         return ExternalDeviceSelectionPlan(
             physical_keys=physical_keys,
             slots=self.slots[:rows],
@@ -225,13 +139,7 @@ class ExternalPlanFusedPlanner(ExternalPlanReservation):
             union_owner=self.union_owner[:batch],
             union_miss=self.union_miss[:batch],
             union_cacheable=self.union_cacheable[:batch],
-            mapping_epoch=(
-                mapping_epoch
-                if input_selection is not None
-                else self.resident._epoch_tensor(mapping_epoch).clone()
-            ),
+            mapping_epoch=mapping_epoch,
             input_selection=input_selection,
-            native_execution=(native_inputs, native_outputs, context, cache)
-            if defer_execution
-            else None,
+            native_execution=(native_inputs, native_outputs, context, cache),
         )

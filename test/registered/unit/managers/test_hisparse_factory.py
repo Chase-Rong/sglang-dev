@@ -49,28 +49,6 @@ def test_staging_defaults_to_native_but_excludes_missing_and_npu(factory):
     assert not factory.module.uses_hisparse_staging(SimpleNamespace(uses_staging=False))
 
 
-@pytest.mark.parametrize(
-    "queue", ["disagg_prefill_bootstrap_queue", "disagg_decode_prealloc_queue"]
-)
-def test_pending_pd_layer_writer_prevents_npu_idle(factory, queue):
-    pending = Mock(return_value=True)
-    scheduler = SimpleNamespace(
-        hisparse_coordinator=SimpleNamespace(uses_staging=False),
-        **{
-            queue: SimpleNamespace(
-                kv_manager=SimpleNamespace(has_pending_layer_transfers=pending)
-            )
-        },
-    )
-    assert factory.module.has_pending_hisparse_transfers(scheduler)
-    pending.return_value = False
-    assert not factory.module.has_pending_hisparse_transfers(scheduler)
-    scheduler.hisparse_coordinator = object()
-    pending.reset_mock()
-    assert not factory.module.has_pending_hisparse_transfers(scheduler)
-    pending.assert_not_called()
-
-
 def test_disabled_factory_does_not_construct_or_import_backends(factory):
     factory.memory.enable_hisparse = False
     assert factory.module.create_hisparse_coordinator(object()) is None

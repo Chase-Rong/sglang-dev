@@ -1,11 +1,8 @@
 """Host memory registration and row copies for Ascend HiSparse."""
 
-import ctypes
-import os
 from dataclasses import dataclass
 from math import prod
 from typing import Optional, Sequence, Tuple
-from uuid import uuid4
 
 import torch
 
@@ -16,92 +13,11 @@ def host_ops():
     return load_host()
 
 
-def _ctype_for_dtype(dtype: torch.dtype):
-    if dtype in (torch.float16, torch.bfloat16):
-        return ctypes.c_uint16
-    if dtype == torch.float32:
-        return ctypes.c_float
-    if dtype == torch.float64:
-        return ctypes.c_double
-    if dtype == torch.int8:
-        return ctypes.c_int8
-    if dtype == torch.uint8:
-        return ctypes.c_uint8
-    if dtype == torch.int16:
-        return ctypes.c_int16
-    if dtype == torch.int32:
-        return ctypes.c_int32
-    if dtype == torch.int64:
-        return ctypes.c_int64
-    if dtype == torch.bool:
-        return ctypes.c_bool
-    raise TypeError(f"unsupported shm tensor dtype: {dtype}")
-
-
-def create_shm_tensor(
-    shape: Sequence[int],
-    dtype: torch.dtype,
-    device_id: int = 0,
-    name: str = "",
-) -> Tuple[torch.Tensor, int, int]:
-    """Create host shared memory and register it to an NPU device.
-
-    Returns ``(host_tensor, host_ptr, dev_ptr)``. ``host_tensor`` is a CPU
-    tensor backed by the registered shared memory. ``dev_ptr`` is the
-    device-visible address and can be passed to sparse KV kernels through
-    ``src_ptr``/``dst_ptr``.
-    """
-    shape_tuple = tuple(int(dim) for dim in shape)
-    if any(dim < 0 for dim in shape_tuple):
-        raise ValueError(f"shape dimensions must be non-negative, got {shape_tuple}")
-
-    numel = int(prod(shape_tuple))
-    elem_size = torch.empty((), dtype=dtype).element_size()
-    size = numel * elem_size
-    if size <= 0:
-        raise ValueError(f"shm tensor size must be positive, got shape={shape_tuple}")
-    buffer_type = _ctype_for_dtype(dtype) * numel
-    name = name or f"sgl-tensor-{uuid4().hex}"
-
-    host_ptr, dev_ptr = host_ops().shm_allocator_create_and_register(
-        size, device_id, name
-    )
-    try:
-        buffer = buffer_type.from_address(host_ptr)
-        tensor = torch.frombuffer(buffer, dtype=dtype).view(shape_tuple)
-        if tensor.element_size() != elem_size:
-            raise RuntimeError("shm tensor element size mismatch")
-    except Exception:
-        host_ops().shm_allocator_free_by_name(name, device_id)
-        raise
-    return tensor, int(host_ptr), int(dev_ptr)
-
-
-@dataclass
-class SharedHostHandle:
-    """Linux IPC-namespace-local segment identity; never a process pointer.
-
-    An exporter must retain its mapping until every consumer has attached.
-    Consumers register their own device address and detach independently.
-    This handle belongs on a trusted node-local bootstrap channel, not PD wire.
-    """
-
-    segment: int
-    nbytes: int
-    creator: int
-    created: int
-    ipc_device: int
-    ipc_inode: int
-    shape: Tuple[int, ...]
-    dtype: str
-    version: int = 1
-
-
 @dataclass
 class RegisteredHostRegion:
     """Host tensor plus its NPU-visible registered address.
 
-    Explicit close requires drained device, transport and captured-graph users.
+    Explicit close requires drained device and captured-graph users.
     Tensor aliases must not outlive close. There is deliberately no destructor
     that could unregister memory while asynchronous users still reference it.
     """
@@ -112,86 +28,6 @@ class RegisteredHostRegion:
     device_id: int
     name: str
     closed: bool = False
-
-    @classmethod
-    def allocate(
-        cls,
-        shape: Sequence[int],
-        dtype: torch.dtype,
-        *,
-        device_id: int = 0,
-        name: str = "",
-    ) -> "RegisteredHostRegion":
-        name = name or f"sgl-region-{uuid4().hex}"
-        tensor, host_ptr, device_ptr = create_shm_tensor(
-            shape, dtype, device_id=device_id, name=name
-        )
-        return cls(tensor, host_ptr, device_ptr, device_id, name)
-
-    def export_handle(self) -> SharedHostHandle:
-        self._require_live()
-        namespace = os.stat("/proc/self/ns/ipc")
-        segment, size, creator, created = host_ops().shm_allocator_export(
-            self.name, self.device_id
-        )
-        return SharedHostHandle(
-            segment,
-            size,
-            creator,
-            created,
-            namespace.st_dev,
-            namespace.st_ino,
-            tuple(self.tensor.shape),
-            str(self.tensor.dtype),
-        )
-
-    @classmethod
-    def attach(
-        cls, handle: SharedHostHandle, *, device_id: int, name: str = ""
-    ) -> "RegisteredHostRegion":
-        namespace = os.stat("/proc/self/ns/ipc")
-        if handle.version != 1 or (handle.ipc_device, handle.ipc_inode) != (
-            namespace.st_dev,
-            namespace.st_ino,
-        ):
-            raise ValueError("shared Host handle version or IPC namespace mismatch")
-        dtype_name = handle.dtype.removeprefix("torch.")
-        dtype = getattr(torch, dtype_name, None)
-        if not isinstance(dtype, torch.dtype):
-            raise ValueError("shared Host handle has unsupported dtype")
-        ctype = _ctype_for_dtype(dtype)
-        if any(type(dim) is not int or dim <= 0 for dim in handle.shape):
-            raise ValueError("shared Host handle has invalid shape")
-        numel = prod(handle.shape)
-        if numel * torch.empty((), dtype=dtype).element_size() != handle.nbytes:
-            raise ValueError("shared Host handle shape and byte size mismatch")
-        name = name or f"sgl-attach-{uuid4().hex}"
-        host_ptr, device_ptr = host_ops().shm_allocator_attach(
-            handle.segment,
-            handle.nbytes,
-            handle.creator,
-            handle.created,
-            device_id,
-            name,
-        )
-        try:
-            buffer = (ctype * numel).from_address(host_ptr)
-            tensor = torch.frombuffer(buffer, dtype=dtype).view(handle.shape)
-            return cls(tensor, host_ptr, device_ptr, device_id, name)
-        except Exception:
-            host_ops().shm_allocator_free_by_name(name, device_id)
-            raise
-
-    def close(self, *, drained: bool = False) -> None:
-        if self.closed:
-            return
-        if not drained:
-            raise RuntimeError("registered Host users must be drained before close")
-        host_ops().shm_allocator_free_by_name(self.name, self.device_id)
-        self.closed = True
-        self.host_ptr = 0
-        self.device_ptr = 0
-        self.tensor = torch.empty(0, dtype=self.tensor.dtype)
 
     def _require_live(self) -> None:
         if self.closed:
@@ -238,31 +74,6 @@ def copy_rows_to_registered_host(
         dst_address_ndims=1,
         block_dim=block_dim,
         dst_ptr=dst_region.device_ptr,
-    )
-
-
-def copy_rows_from_registered_host(
-    src_region: RegisteredHostRegion,
-    dst: torch.Tensor,
-    src_index: torch.Tensor,
-    dst_index: torch.Tensor,
-    valid_mask: torch.Tensor,
-    *,
-    block_dim: int = 8,
-) -> torch.Tensor:
-    """Copy rows from a registered Host region into an NPU tensor."""
-
-    src_region._require_live()
-    return unidex_copy_inplace(
-        src=src_region.tensor,
-        dst=dst,
-        src_index=src_index,
-        dst_index=dst_index,
-        valid_mask=valid_mask,
-        src_address_ndims=1,
-        dst_address_ndims=1,
-        block_dim=block_dim,
-        src_ptr=src_region.device_ptr,
     )
 
 
